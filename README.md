@@ -8,7 +8,7 @@ La mayoría de la documentación de KMP explica *qué es* cada pieza (Koin, SQLD
 
 ## Cómo está armado cada archivo
 
-Los ~78 archivos `.md` del repo siguen una estructura fija de 6 secciones:
+Los ~88 archivos `.md` del repo siguen una estructura fija de 6 secciones:
 
 1. **Qué es** — definición concreta, sin rodeos.
 2. **El problema que resuelve** — qué pasaba antes / qué pasa si no existiera.
@@ -29,19 +29,18 @@ Los packages están numerados para lectura tipo "bosque completo → detalle", p
 |---|---|
 | `01_kotlin_fundamentals/` | Scope functions, null safety, sealed classes, data class, generics, keywords |
 | `02_domain/` | Model, UseCases, Repository contracts, Result pattern |
-| `03_data/` | RepositoryImpl, DTOs/Mappers, Ktor remote, storage local, engines por plataforma |
+| `03_data/` | RepositoryImpl, DTOs/Mappers, Ktor remote, Retrofit (contraste), storage local, engines por plataforma |
 | `04_di/` | Koin, comparación con Dagger/Hilt y Kodein |
-| `05_platform/` | expect/actual, source set hierarchy |
+| `05_platform/` | expect/actual, source set hierarchy, Android lifecycle y fundamentals |
 | `06_presentation_mvi/` | Contract (State/Event/Effect), ViewModel, MVI vs MVVM |
 | `07_coroutines/` | Suspend/scope, Dispatchers, launch vs async, SupervisorJob |
 | `08_flow/` | Flow, StateFlow, SharedFlow/Channel |
-| `09_ui_compose/` | Layouts, modifiers, listas, Material3, recomposición, stability, effects, navegación, animaciones |
-| `10_ios_interop/` | Kotlin/Native, XCFramework, memory model, interop con Swift |
+| `09_ui_compose/` | Layouts, modifiers, listas, Material3, recomposición, stability, effects, navegación, animaciones, accesibilidad, profiling/leaks, Navigation 3 |
+| `10_ios_interop/` | Kotlin/Native, XCFramework, memory model, interop con Swift, Swift Export |
 | `11_gradle/` | Modularización, convention plugins, version catalog, BuildKonfig |
-| `12_testing/` | Estrategia de testing, fakes vs mocks, Turbine |
+| `12_testing/` | Estrategia de testing, fakes vs mocks, Turbine, Espresso, Paparazzi, Detekt/JaCoCo |
 | `13_git_y_equipo/` | Branching, merge vs rebase, PRs, conventional commits, CI/CD |
 | `14_criterio_y_decisiones/` | Traducir requisitos de PO, matriz de stack, red flags |
-| `15_ambientes_y_build_config/` | Flavors/schemes, BuildKonfig multi-ambiente, pipelines, CI/CD multi-ambiente |
+| `15_ambientes_y_build_config/` | Flavors/schemes, BuildKonfig multi-ambiente, pipelines, CI/CD multi-ambiente, publicación en Play Console |
 | `16_seguridad_mobile/` | TLS/pinning, Play Integrity, app shielding, SDKs de terceros |
 | `17_observabilidad_produccion/` | Logging estructurado, telemetry/performance, tracking de eventos |
-
