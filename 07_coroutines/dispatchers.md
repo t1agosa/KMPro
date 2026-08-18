@@ -1,100 +1,108 @@
 # 07_coroutines / `dispatchers.md`
 
----
+## 1. Mapa del flujo
 
-## 1. Qué es
+```mermaid
+flowchart TD
+    A["scope.launch { }"] --> B{"¿Qué tipo de trabajo hace?"}
+    B -->|"I/O: red, disco, DB"| C["Dispatchers.IO"]
+    B -->|"Cálculo pesado de CPU"| D["Dispatchers.Default"]
+    B -->|"Tocar UI / actualizar State"| E["Dispatchers.Main"]
+    C --> F["withContext(Dispatchers.IO) { }"]
+    D --> G["withContext(Dispatchers.Default) { }"]
+    F -->|"al salir del bloque"| E
+    G -->|"al salir del bloque"| E
+```
 
-Un `Dispatcher` decide **en qué thread (o pool de threads) corre una coroutine**. La coroutine en sí es independiente del thread — el `Dispatcher` es quien la asigna a uno concreto, y puede reasignarla a otro distinto cada vez que se reanuda después de una suspensión.
+Este diagrama hace zoom sobre el nodo D/E de `coroutines_suspend_scope.md` ("Thread se libera" / "Thread hace otra cosa"): acá se responde específicamente **en qué thread** pasa cada parte de ese flujo, y por qué el punto de entrada (`launch`) casi siempre arranca en `Main` pero el cuerpo se desvía a otro dispatcher según el tipo de trabajo.
 
-Los tres principales:
+## 2. Qué es y cómo funciona
 
-- **`Dispatchers.Main`**: el thread de UI. Único thread donde está permitido tocar la UI directamente.
-- **`Dispatchers.IO`**: pool de threads dimensionado para operaciones bloqueantes de red/disco — pensado para *esperar*, no para calcular.
-- **`Dispatchers.Default`**: pool de threads dimensionado según los cores de CPU disponibles — pensado para cálculo pesado (parsing grande, ordenar listas enormes, procesamiento de imágenes).
+Un `Dispatcher` decide en qué thread (o pool de threads) corre una coroutine. La coroutine en sí es independiente del thread — el `Dispatcher` es quien la asigna a uno concreto, y puede reasignarla a otro distinto cada vez que se reanuda después de una suspensión.
 
-## 2. El problema que resuelve
+Los tres principales, y cómo se relacionan con el diagrama:
 
-Sin `Dispatcher`, una coroutine simplemente corre en el thread donde fue lanzada. Si ese thread es el de UI (`Main`) y la coroutine hace algo bloqueante — una llamada de red síncrona, una query pesada a disco — la UI se congela: no se procesan touches, no se dibujan frames, y si tarda más de unos segundos el sistema operativo puede matar la app (ANR en Android).
+- **`Dispatchers.Main`**: el thread de UI. Es donde arranca típicamente la coroutine (nodo A/E) porque es el único thread donde está permitido tocar la UI o actualizar el `State` directamente.
+- **`Dispatchers.IO`**: pool de threads dimensionado para operaciones bloqueantes de red/disco (nodo C) — pensado para *esperar*, no para calcular. Al ser un pool grande, puede tener muchos threads ociosos esperando respuestas sin que eso cueste caro.
+- **`Dispatchers.Default`**: pool de threads dimensionado según los cores de CPU disponibles (nodo D) — pensado para cálculo pesado real (parsing grande, ordenar listas enormes, procesar una imagen).
 
-El problema inverso también existe: usar un pool pensado para I/O (`IO`, con muchos threads porque la mayoría están *esperando*, no trabajando) para hacer cálculo pesado de CPU satura ese pool con trabajo que no es su propósito, y usar `Default` (pool acotado al número de cores) para I/O bloqueante puede dejar sin threads disponibles a otras tareas de cálculo real que sí los necesitan.
+Lo importante del diagrama es el camino de vuelta: `withContext(Dispatchers.IO) { }` o `withContext(Dispatchers.Default) { }` cambian el thread **solo para ese bloque**, y al terminar vuelven automáticamente al dispatcher que tenía la coroutine antes de entrar (normalmente `Main`) — no hace falta un `withContext(Dispatchers.Main)` explícito después para "volver". Por convención de arquitectura, esta decisión vive en la capa `data` (quien sabe que está hablando con red o disco), nunca se filtra hacia `domain` (los `UseCase` no importan `Dispatchers` en absoluto) ni hacia `presentation` (el `ViewModel` solo hace `viewModelScope.launch { }` y confía en que el repository ya resolvió en qué thread corre cada cosa).
 
-`Dispatchers` resuelve esto separando explícitamente "dónde correr según el tipo de carga", sin que el desarrollador tenga que crear y gestionar thread pools a mano.
+## 3. Cómo se ve en distintos contextos
 
-## 3. Ejemplo mínimo comentado
+**App de fitness:** al guardar una rutina completada, el repositorio hace `withContext(Dispatchers.IO)` para escribir en la base de datos local y sincronizar con el backend — ambas son operaciones de espera, no de cálculo. Si después esa misma función necesitara recalcular estadísticas agregadas (promedio de calorías de los últimos 30 días sobre miles de registros), eso es CPU real y debería separarse en su propio `withContext(Dispatchers.Default)`, no compartir el mismo bloque con la escritura a disco.
+
+**App de e-commerce:** al aplicar un filtro de búsqueda sobre un catálogo de productos ya cargado en memoria (sin volver a pedirlo al backend), ese filtrado y ordenamiento es trabajo de `Dispatchers.Default` si el catálogo es grande — no hay I/O involucrado, es puro cómputo sobre datos que ya están en RAM.
+
+## 4. Implementación real
+
+El PO pide: en la pantalla de Historial de Pedidos, además de traer los pedidos del backend, hay que ordenarlos por un score de relevancia que se calcula localmente (pedidos recientes con productos favoritos del usuario pesan más) antes de mostrarlos.
 
 ```kotlin
-class PlayerRepositoryImpl(
-    private val api: PlayerApi,
-    private val dao: PlayerDao
-) : PlayerRepository {
+class OrderRepositoryImpl(
+    private val api: OrderApi,
+    private val dao: OrderDao
+) : OrderRepository {
 
-    override suspend fun refreshPlayer(id: String): Player = withContext(Dispatchers.IO) {
-        // acá adentro corre en el pool de IO: llamada de red bloqueante-friendly
-        val remote = api.getPlayer(id)
-        dao.save(remote.toEntity())
-        remote.toDomain()
+    // I/O real: llamada de red + escritura a disco
+    override suspend fun refreshOrders(): Unit = withContext(Dispatchers.IO) {
+        val remoteOrders = api.fetchOrders()
+        dao.saveAll(remoteOrders.map { it.toEntity() })
+    }
+
+    // I/O real: lectura de disco
+    private suspend fun getStoredOrders(): List<Order> = withContext(Dispatchers.IO) {
+        dao.getAll().map { it.toDomain() }
+    }
+
+    // CPU real: recorre y puntúa cada pedido, no espera nada externo
+    override suspend fun getOrdersRankedByRelevance(): List<Order> {
+        val orders = getStoredOrders() // ya resuelto en IO, adentro
+        return withContext(Dispatchers.Default) {
+            orders.sortedByDescending { calculateRelevanceScore(it) }
+        }
+    }
+
+    private fun calculateRelevanceScore(order: Order): Double {
+        // cálculo pesado: pondera fecha, cantidad de ítems, categorías favoritas, etc.
+        // (implementación omitida — lo relevante acá es que es CPU-bound)
+        return 0.0
     }
 }
+```
 
-class PlayerDetailViewModel(
-    private val getPlayer: GetPlayerUseCase
-) : ViewModel() {
+```kotlin
+class OrdersViewModel(
+    private val getOrdersRankedByRelevanceUseCase: GetOrdersRankedByRelevanceUseCase
+) {
+    private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    fun onEvent(event: PlayerDetailEvent.OnLoad) {
+    fun onEvent(event: OrdersEvent) {
+        when (event) {
+            OrdersEvent.OnScreenEntered -> loadOrders()
+        }
+    }
+
+    private fun loadOrders() {
         viewModelScope.launch {
-            // viewModelScope ya arranca en Dispatchers.Main.immediate
+            // acá seguimos en Main — el ViewModel nunca decide dónde corre el I/O ni el cálculo
             _state.update { it.copy(isLoading = true) }
-            val player = getPlayer(event.id) // adentro hace el switch a IO y vuelve solo
-            // acá ya estamos de nuevo en Main, es seguro tocar el State para la UI
-            _state.update { it.copy(player = player, isLoading = false) }
+            val orders = getOrdersRankedByRelevanceUseCase()
+            // de vuelta en Main automáticamente al salir de los withContext internos
+            _state.update { it.copy(orders = orders, isLoading = false) }
         }
     }
 }
 ```
 
-El punto clave: `withContext(Dispatchers.IO)` cambia el thread solo para ese bloque, y al terminar **vuelve automáticamente** al dispatcher que tenía la coroutine antes de entrar — no hace falta un `withContext(Dispatchers.Main)` explícito después para "volver". El `ViewModel` nunca tiene que preocuparse por dispatchers: la responsabilidad de decidir dónde correr el I/O vive en la capa `data`, no en `presentation`.
+El punto central: `refreshOrders()` y `getStoredOrders()` usan `IO` porque esperan una respuesta externa; `calculateRelevanceScore` corre en `Default` porque es la CPU trabajando de verdad. El `ViewModel` no sabe nada de esto — solo ve `suspend fun` que devuelven un resultado.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes — checklist de auditoría
 
-| Escenario | Dispatcher | Por qué |
-|---|---|---|
-| Llamada de red (Ktor), query a DB (SQLDelight/Room), lectura de archivo | `Dispatchers.IO` | Pool grande pensado para threads que pasan la mayor parte del tiempo esperando, no consumiendo CPU |
-| Parsear un JSON gigante, ordenar/filtrar una lista de miles de ítems, procesar una imagen | `Dispatchers.Default` | Pool acotado al número de cores, pensado para que la CPU esté realmente ocupada calculando |
-| Actualizar el `State` del ViewModel, cualquier cosa que toque la UI | `Dispatchers.Main` | Es el único thread donde el framework de UI permite mutar vistas/composables de forma segura |
-| Código dentro de `viewModelScope.launch { }` sin especificar dispatcher | ya es `Main` por default | `viewModelScope` usa `Dispatchers.Main.immediate` internamente, no hace falta declararlo |
-| Una función de `data` que hace I/O | envolver el cuerpo en `withContext(Dispatchers.IO)` | La capa `data` es responsable de decidir su propio dispatcher — el `ViewModel` no debería saber ni importarle en qué thread corre el repository |
+Si esta parte del código la entregó una IA, revisar puntualmente:
 
-**NO uses:**
-- `Dispatchers.IO` para cálculo pesado (ordenar una lista de 50.000 elementos, por ejemplo) — satura un pool dimensionado para *esperar*, no para *trabajar*, con tareas que si compiten por CPU real dejan sin threads disponibles a otras operaciones de I/O concurrentes.
-- `Dispatchers.Main` para cualquier cosa que no sea actualizar UI o código muy liviano — cualquier bloqueo ahí congela la app entera.
-- Un `Dispatcher` custom armado a mano sin necesidad real — `IO`/`Default`/`Main` cubren el 95% de los casos; un dispatcher custom (`limitedParallelism`, por ejemplo) es para casos puntuales de control fino de concurrencia, no el default.
-
-## 5. Caso trampa
-
-Un compañero escribe esto para "optimizar" la carga de la lista de jugadores, porque leyó que `Dispatchers.IO` "es para hacer cosas en paralelo, más rápido":
-
-```kotlin
-override suspend fun getPlayersSorted(): List<Player> = withContext(Dispatchers.IO) {
-    val players = dao.getAll() // I/O real: query a la DB
-    players.sortedByDescending { calculateComplexRanking(it) } // CPU-bound: cálculo pesado por cada jugador
-}
-```
-
-Se ve razonable: todo el bloque está en `IO`, "así no bloquea la UI". La trampa es que `dao.getAll()` **sí** es I/O legítimo para `Dispatchers.IO`, pero `sortedByDescending { calculateComplexRanking(it) }` — si `calculateComplexRanking` hace matemática pesada por cada jugador (no solo comparar dos `Int`) — es trabajo de CPU, no de espera. Metido dentro del mismo `withContext(Dispatchers.IO)`, ese cálculo ocupa un thread del pool de IO que debería estar disponible para otras llamadas de red/disco concurrentes en la app, en vez de correr en el pool de `Default` que está pensado y dimensionado justamente para eso.
-
-La versión correcta separa las dos responsabilidades:
-
-```kotlin
-override suspend fun getPlayersSorted(): List<Player> {
-    val players = withContext(Dispatchers.IO) { dao.getAll() }
-    return withContext(Dispatchers.Default) {
-        players.sortedByDescending { calculateComplexRanking(it) }
-    }
-}
-```
-
-La pregunta trampa de entrevista es exactamente esta: *"¿esto está bien optimizado?"* — la respuesta no es "sí, porque usa `IO`", sino identificar que el bloque mezcla dos tipos de carga distintos bajo un solo dispatcher.
-
-## 6. Conexión con arquitectura real
-
-En Timbax, toda función de `RepositoryImpl` que toca `SQLDelight` o `GitLive Firebase SDK` envuelve su cuerpo en `withContext(Dispatchers.IO)` — esa decisión vive enteramente en la capa `data`, nunca se filtra hacia `domain` (los `UseCase` no importan `kotlinx.coroutines.Dispatchers` en absoluto) ni hacia `presentation` (el `ViewModel` solo hace `viewModelScope.launch { }` y confía en que quien implementa el repository ya resolvió en qué thread corre cada cosa). Esto es la misma Dependency Rule aplicada a concurrencia: la capa externa (`data`) sabe de detalles técnicos de ejecución: la interna (`domain`) no sabe que los dispatchers existen.
+- **¿Metió cálculo pesado de CPU dentro de un `withContext(Dispatchers.IO)`?** Es el error más común: la IA ve "esto tarda" y asume que es `IO` sin distinguir si el motivo de la demora es *esperar una respuesta externa* o *la CPU procesando algo*. Un `sortedByDescending` con un comparador costoso metido dentro de un bloque de `IO` que también hace una query a la DB está mezclando dos tipos de carga bajo el dispatcher equivocado para la mitad de ese trabajo.
+- **¿Usa `Dispatchers.Main` para algo que no sea actualizar UI o código muy liviano?** Cualquier bloqueo ahí congela la app entera — si hay una llamada de red o un cálculo pesado corriendo directo en `Main` sin `withContext`, es un bug serio de responsividad, no un detalle menor.
+- **¿Envuelve toda una función de `data` en `withContext` aunque ya esté corriendo en un dispatcher correcto por herencia?** No es un error funcional, pero es ruido — si una `suspend fun` de `data` es llamada siempre desde un contexto que ya está en `IO` (por ejemplo, porque quien la llama ya hizo el `withContext`), envolverla de nuevo es redundante. Vale la pena marcarlo, aunque no rompe nada.
+- **¿Arma un `Dispatcher` custom (`limitedParallelism`, un `Executor` propio) sin una razón concreta?** `IO`/`Default`/`Main` cubren la gran mayoría de los casos reales. Un dispatcher custom es para control fino de concurrencia en escenarios puntuales (limitar cuántas coroutines acceden a un recurso compartido a la vez, por ejemplo) — si aparece sin que el problema lo pida, es sobreingeniería.
+- **¿El `ViewModel` importa `kotlinx.coroutines.Dispatchers` directamente?** Es una señal de que la decisión de dispatcher se filtró a la capa equivocada — esa responsabilidad debería vivir enteramente en `data`, nunca en `presentation`.

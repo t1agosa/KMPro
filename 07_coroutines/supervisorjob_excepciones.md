@@ -1,102 +1,107 @@
 # 07_coroutines / `supervisorjob_excepciones.md`
 
----
+## 1. Mapa del flujo
 
-## 1. Qué es
+```mermaid
+flowchart TD
+    A["CoroutineScope(Job() + ...)"] -->|"launch hijo 1"| B[Falla con excepción]
+    A -->|"launch hijo 2"| C[Sigue corriendo]
+    B -.->|"Job normal: se propaga hacia arriba"| D[Cancela TODO el scope]
+    D -.-> C
 
-Por default, un `Job` normal propaga las excepciones de forma agresiva: si una coroutine hija lanza una excepción no capturada, **cancela a todas sus hermanas** y se propaga hacia el `Job` padre. `SupervisorJob` es una variante donde el fallo de una hija **no** cancela a sus hermanas ni se propaga hacia arriba — cada hija falla de forma aislada, como si fueran tareas independientes bajo el mismo scope.
+    E["CoroutineScope(SupervisorJob() + ...)"] -->|"launch hijo 1"| F[Falla con excepción]
+    E -->|"launch hijo 2"| G[Sigue corriendo, no se entera]
+    F -->|"aislado, no se propaga"| H[Solo esa coroutine termina]
 
-`viewModelScope` usa internamente `SupervisorJob() + Dispatchers.Main.immediate`, justo por este motivo: un error cargando `stats` no debería tirar abajo la carga de `players` que corre en paralelo en la misma pantalla.
-
-## 2. El problema que resuelve
-
-Con un `Job` normal, este código es una bomba de tiempo:
-
-```kotlin
-val scope = CoroutineScope(Job() + Dispatchers.Main) // Job normal, no Supervisor
-
-scope.launch { repository.getPlayers() }  // si esto falla...
-scope.launch { repository.getStats() }    // ...esto se cancela también, aunque no tenga nada que ver
+    I["scope.cancel()"] -->|"lanza CancellationException"| J{"¿El catch la relanza?"}
+    J -->|"No, la traga"| K[Cancelación rota: la coroutine sigue viva]
+    J -->|"Sí, la relanza"| L[Cancelación cooperativa correcta]
 ```
 
-Si `getPlayers()` lanza una excepción, el `Job` padre la propaga y cancela **todo** el scope — incluida la coroutine de `getStats()`, que ni siquiera falló. En una pantalla con varias secciones cargando datos independientes (dashboard con múltiples widgets, por ejemplo), esto significa que un solo error tumba toda la pantalla en vez de solo la sección afectada.
+Este diagrama tiene dos partes independientes que responden a la misma pregunta de fondo — "¿qué pasa cuando algo sale mal dentro de una coroutine?" — desde dos ángulos: la mitad de arriba es sobre **excepciones de negocio** (una llamada falla) y cómo `Job` vs `SupervisorJob` deciden si eso contamina a las coroutines hermanas. La mitad de abajo es sobre **cancelación** (alguien pidió parar) y cómo un `catch` mal escrito puede interferir con eso — es el mismo mecanismo de propagación de excepciones de Kotlin, pero con una excepción especial (`CancellationException`) que necesita tratamiento distinto.
 
-`SupervisorJob` resuelve esto aislando el fallo: cada `launch` bajo un `SupervisorJob` es responsable de su propio destino, y un error en uno no contamina a los demás.
+## 2. Qué es y cómo funciona
 
-## 3. Ejemplo mínimo comentado
+Por default, un `Job` normal propaga las excepciones de forma agresiva: si una coroutine hija lanza una excepción no capturada, cancela a todas sus hermanas y se propaga hacia el `Job` padre (nodo B→D→C del diagrama). `SupervisorJob` es una variante donde el fallo de una hija no cancela a sus hermanas ni se propaga hacia arriba — cada hija falla de forma aislada, como si fueran tareas independientes bajo el mismo scope (nodo F→H, G no se entera).
+
+`viewModelScope` usa internamente `SupervisorJob() + Dispatchers.Main.immediate`, justo por este motivo: un error cargando una sección de una pantalla no debería tirar abajo la carga de otra sección que corre en paralelo.
+
+**Cancelación cooperativa** es un mecanismo distinto que usa el mismo canal (excepciones) para una cosa distinta (parar, no fallar). Cuando se llama `scope.cancel()`, Kotlin no "mata" la coroutine a la fuerza — le lanza una `CancellationException` en el próximo punto de suspensión, y espera que esa excepción se propague hacia afuera sin interferencia para que la coroutine termine limpio. El problema (nodo J del diagrama): `CancellationException` es una subclase de `Exception`, así que un `catch (e: Exception)` genérico la atrapa **también** a ella, no solo a los errores de negocio que el catch quería manejar. Si ese catch no relanza la `CancellationException` explícitamente, la cancelación queda "tragada" — la coroutine cree que manejó un error más y sigue ejecutando código que en realidad ya debería haber parado.
+
+Cómo se relacionan ambos mecanismos: `SupervisorJob` decide **si** el fallo de una coroutine contamina a otras. La cancelación cooperativa decide **si** una coroutine individual respeta cuando le piden parar. Son ejes distintos, pero ambos dependen de que las excepciones se propaguen correctamente por la jerarquía de coroutines — y por eso un mismo error de código (un `catch` demasiado amplio) puede romper cualquiera de los dos.
+
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness:** la pantalla de dashboard carga en paralelo el resumen semanal y el ranking de amigos, cada uno en su propio `launch` dentro de `viewModelScope`. Si el ranking falla porque el usuario no tiene amigos agregados todavía, el resumen semanal (que no depende de eso) se muestra igual — gracias a `SupervisorJob`, ese fallo no tumba la pantalla completa, solo esa sección queda en estado de error.
+
+**App de e-commerce:** al salir de la pantalla de checkout a mitad de una validación de stock, el scope de esa pantalla se cancela. Si el código que valida el stock tiene un `catch (e: Exception)` genérico alrededor de la llamada de red sin relanzar `CancellationException`, esa validación sigue corriendo en segundo plano después de que el usuario ya volvió a la pantalla anterior — un caso típico de cancelación rota que no se nota hasta que aparece un crash o un estado inconsistente más adelante.
+
+## 4. Implementación real
+
+El PO pide: en la pantalla de Historial de Pedidos, cargar en paralelo el historial y el resumen de puntos de fidelidad — dos secciones independientes que pueden fallar por separado sin afectarse entre sí.
 
 ```kotlin
-class DashboardViewModel(
-    private val getPlayers: GetPlayersUseCase,
-    private val getStats: GetStatsUseCase
-) : ViewModel() {
+class OrdersViewModel(
+    private val getOrderHistoryUseCase: GetOrderHistoryUseCase,
+    private val getLoyaltyPointsUseCase: GetLoyaltyPointsUseCase
+) {
+    // SupervisorJob: el fallo de una sección no debe cancelar la otra
+    private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private val _state = MutableStateFlow(DashboardState())
-    val state: StateFlow<DashboardState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(OrdersState())
+    val state: StateFlow<OrdersState> = _state.asStateFlow()
 
-    fun onEvent(event: DashboardEvent.OnLoad) {
-        // viewModelScope ya trae SupervisorJob internamente, no hace falta declararlo
-        viewModelScope.launch {
-            try {
-                val players = getPlayers()
-                _state.update { it.copy(players = players) }
-            } catch (e: Exception) {
-                _state.update { it.copy(playersError = e.message) }
+    fun onEvent(event: OrdersEvent) {
+        when (event) {
+            OrdersEvent.OnScreenEntered -> {
+                loadOrderHistory()
+                loadLoyaltyPoints()
             }
         }
+    }
 
+    private fun loadOrderHistory() {
         viewModelScope.launch {
             try {
-                val stats = getStats()
-                _state.update { it.copy(stats = stats) }
+                val orders = getOrderHistoryUseCase()
+                _state.update { it.copy(orders = orders) }
+            } catch (e: CancellationException) {
+                throw e // la cancelación se relanza siempre, nunca se trata como un error de negocio
             } catch (e: Exception) {
-                _state.update { it.copy(statsError = e.message) }
+                _state.update { it.copy(ordersError = e.message) }
+            }
+        }
+    }
+
+    private fun loadLoyaltyPoints() {
+        viewModelScope.launch {
+            try {
+                val points = getLoyaltyPointsUseCase()
+                _state.update { it.copy(loyaltyPoints = points) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
                 // este catch atrapa el error solo porque el scope está protegido con SupervisorJob;
-                // si getPlayers() falla en el otro launch, esta coroutine sigue viva
+                // si loadOrderHistory() falla sin manejo, esta coroutine sigue viva de todos modos
+                _state.update { it.copy(loyaltyPointsError = e.message) }
             }
         }
     }
-}
-```
 
-Cada `launch` tiene su propio `try/catch` — eso maneja el error *dentro* de esa coroutine puntual. Lo que `SupervisorJob` garantiza por separado es que, aunque uno de los dos `launch` fallara sin `try/catch` (excepción no capturada), el otro `launch` no se cancelaría por eso.
-
-## 4. Matriz de criterio
-
-| Escenario | Qué usar | Por qué |
-|---|---|---|
-| Varias operaciones independientes en paralelo en la misma pantalla (dashboard con secciones separadas) | `SupervisorJob` (ya viene incluido en `viewModelScope`) | El fallo de una sección no debería tumbar las demás |
-| Una secuencia de pasos donde el segundo depende del éxito del primero | `Job` normal (comportamiento por default fuera de `viewModelScope`) | Si el primer paso falla, tiene sentido que se cancele todo lo que dependía de él |
-| Capturar el error de una `suspend fun` específica dentro de un `launch` | `try/catch` alrededor de la llamada | Forma más directa y predecible, funciona igual con o sin `SupervisorJob` |
-| Capturar excepciones no manejadas de coroutines lanzadas con `launch`, a nivel scope | `CoroutineExceptionHandler` instalado en el scope | Útil como red de seguridad general, pero no reemplaza el `try/catch` puntual para manejar el error de forma específica (ej: mostrar un mensaje distinto según qué operación falló) |
-| Un `async` que puede fallar | `try/catch` alrededor del `.await()` | La excepción queda "guardada" dentro del `Deferred` hasta que se llama `.await()`, ahí se relanza — `CoroutineExceptionHandler` no aplica igual a `async` |
-
-**NO uses:**
-- `CoroutineExceptionHandler` como único mecanismo de manejo de errores en un `ViewModel` — sirve como red de seguridad para excepciones realmente no anticipadas, pero no da forma de reflejar el error en el `State` de una sección específica de la UI; para eso siempre hace falta `try/catch` puntual.
-- Un `Job()` normal a mano en un `ViewModel` en vez de confiar en `viewModelScope` — reintroducís el problema que `SupervisorJob` ya resuelve, sin necesidad.
-
-## 5. Caso trampa
-
-Un compañero reporta: *"mi app se cierra cuando falla una llamada de red, aunque tengo `try/catch` alrededor del `.await()`"*:
-
-```kotlin
-val scope = CoroutineScope(Job() + Dispatchers.Main) // Job normal, no SupervisorJob
-
-scope.launch {
-    try {
-        val players = async { repository.getPlayers() }
-        val stats = async { repository.getStatsThatFails() } // esto lanza excepción
-        _state.update { it.copy(players = players.await(), stats = stats.await()) }
-    } catch (e: Exception) {
-        _state.update { it.copy(error = e.message) } // nunca se ejecuta
+    fun onCleared() {
+        viewModelScope.cancel() // dispara CancellationException en ambos launch activos
     }
 }
 ```
 
-Se ve razonable: hay un `try/catch` envolviendo los dos `.await()`. Pero el `catch` **nunca se ejecuta**, y la app crashea igual. El motivo: con un `Job()` normal (no `SupervisorJob`), en el momento en que `getStatsThatFails()` lanza la excepción, esa excepción se propaga inmediatamente hacia arriba y **cancela todo el scope** — incluyendo la coroutine que contiene el `try/catch` — antes de que el flujo de ejecución llegue siquiera al bloque `catch`. El `try/catch` en el `.await()` solo funciona como uno espera si el scope está protegido con `SupervisorJob`; si no lo está, la cancelación del scope le gana de mano al `catch`.
+El patrón `catch (e: CancellationException) { throw e }` antes del `catch (e: Exception)` genérico es lo que garantiza que, si `onCleared()` cancela el scope mientras `loadOrderHistory()` está a mitad de camino, esa cancelación se propague limpio en vez de quedar atrapada por el catch genérico y tratada como si fuera un error de red.
 
-La pregunta trampa de entrevista es exactamente esta: *"¿por qué mi `try/catch` no atrapa la excepción si está bien puesto?"* — la respuesta no está en el `try/catch` (está bien escrito), está en qué tipo de `Job` tiene el scope por debajo. `viewModelScope` no tiene este problema porque ya usa `SupervisorJob` internamente — el caso trampa aparece típicamente cuando alguien crea un `CoroutineScope` manual (fuera de `ViewModel`, en un test, en una clase propia) sin especificarlo.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría
 
-## 6. Conexión con arquitectura real
+Si esta parte del código la entregó una IA, revisar puntualmente:
 
-En Timbax, el `ViewModel` de la pantalla de estadísticas de jugador combina la carga de `PlayerStats` (SQLDelight local) con la sincronización de `PlayerAchievements` (Firebase remoto) en dos `launch` separados dentro de `viewModelScope`. Ambas fuentes pueden fallar de forma completamente independiente — sin conexión a internet, `Achievements` falla pero `Stats` (local) carga bien — y gracias a que `viewModelScope` ya trae `SupervisorJob`, el `State` puede reflejar `stats` cargados con `achievementsError` seteado, en vez de que un problema de red tumbe toda la pantalla. Cada `launch` mantiene su propio `try/catch` para mapear la excepción puntual a su campo correspondiente del `State`, siguiendo el mismo patrón del punto 3.
+- **¿Hay un `catch (e: Exception)` (o peor, `catch (e: Throwable)`) alrededor de código suspendible sin relanzar `CancellationException`?** Es el error de cancelación cooperativa más común y más difícil de detectar en review — el código compila, el happy path funciona, y el bug solo aparece cuando alguien sale de la pantalla en el momento exacto en que esa coroutine está corriendo. La forma correcta es capturar `CancellationException` primero y relanzarla, o usar `catch (e: Exception) { if (e is CancellationException) throw e; ... }` si el código no puede tener dos bloques `catch` separados.
+- **¿Usa `Job()` normal en vez de `SupervisorJob()` para operaciones independientes en paralelo?** Si el código arma un `CoroutineScope` manual (fuera de `viewModelScope`) con `Job()` a secas para lanzar varias operaciones que no dependen entre sí, un fallo en cualquiera de ellas va a cancelar a todas las demás — hay que verificar que el tipo de `Job` coincida con la intención real (aislar fallos vs propagarlos).
+- **¿El `try/catch` envuelve un `async { }.await()` asumiendo que alcanza con eso para atrapar el error?** Con un `Job()` normal (no `SupervisorJob`), si otra coroutine hermana falla primero, el scope entero se cancela **antes** de que el flujo llegue al `catch` del `await()` — el catch nunca se ejecuta, aunque esté bien escrito. Esto solo funciona de forma predecible bajo `SupervisorJob`.
+- **¿Usa `CoroutineExceptionHandler` como único mecanismo de manejo de errores?** Sirve como red de seguridad para excepciones realmente no anticipadas, pero no da forma de reflejar un error puntual en el campo correspondiente del `State` — no reemplaza el `try/catch` específico por operación. Además, `CoroutineExceptionHandler` no aplica a `async`: la excepción de un `async` queda guardada en el `Deferred` hasta que se llama `.await()`, ahí recién se relanza.
+- **¿Cada `launch` paralelo tiene su propio manejo de error, o hay un único `try/catch` envolviendo varios `launch` a la vez?** Un solo `try/catch` no puede envolver múltiples `launch` independientes de forma útil — cada `launch` corre su propio bloque, así que el manejo de error tiene que vivir adentro de cada uno si se espera que fallen de forma aislada.
