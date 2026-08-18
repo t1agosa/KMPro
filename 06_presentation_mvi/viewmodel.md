@@ -1,95 +1,102 @@
-# viewmodel.md
+# ViewModel
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-El **ViewModel** es la clase que orquesta una pantalla dentro del patrón MVI: recibe `Event` desde la UI a través de `onEvent()`, decide qué `UseCase` invocar según ese evento, actualiza el `State` con el resultado, y eventualmente emite un `Effect`. Vive en la capa Presentation y es el único punto de la app que conoce tanto el Contract de la pantalla (`06_presentation_mvi`) como los UseCases de Domain (`02_domain`) — nunca al revés.
+```mermaid
+flowchart TD
+    EVENT["onEvent(event)"] --> SCOPE["viewModelScope.launch"]
+    SCOPE --> UC["UseCase()"]
+    UC -- "Result.Success" --> UPDATE["_state.update { }"]
+    UC -- "Result.Error" --> UPDATE
+    SCOPE -. "caso puntual" .-> EMIT["_effect.emit( )"]
+```
 
-No contiene lógica de negocio propia. Su trabajo es **orquestar y traducir**: traduce un Event de usuario en una llamada a UseCase, y traduce el resultado del UseCase (típicamente un `Result<T>`) en una actualización de State.
+Este es el zoom sobre el nodo `VM` de los dos diagramas anteriores (`mvi.md`, `contract_state_event_effect.md`) — acá vive el código real que conecta `Event` con `UseCase`, y el resultado de vuelta con `State`/`Effect`.
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Sin un ViewModel bien delimitado, la lógica de una pantalla termina repartida en dos lugares equivocados:
+El **ViewModel** es la clase que orquesta una pantalla: recibe `Event` desde la UI a través de `onEvent()`, decide qué `UseCase` invocar según ese evento, actualiza el `State` con el resultado, y eventualmente emite un `Effect`. Es el único punto de la app que conoce tanto el Contract de la pantalla como los UseCases de `domain` — nunca al revés.
 
-- **En el Composable**: si el `@Composable` llama directamente a un Repository o UseCase, se rompe la separación de capas (UI depende de Domain sin pasar por Presentation) y se pierde la capacidad de testear esa lógica sin levantar Compose.
-- **En el UseCase**: si el UseCase empieza a manejar `isLoading` o a decidir cuándo mostrar un snackbar, se contamina con lógica de presentación que no le pertenece — un UseCase debería poder reusarse desde cualquier pantalla sin arrastrar detalles de cómo se muestra en una UI específica.
+No contiene lógica de negocio propia. Su trabajo es **orquestar y traducir**: traduce un Event de usuario en una llamada a UseCase, y traduce el resultado del UseCase (típicamente un `Result<T>`) en una actualización de State. Si el ViewModel empieza a decidir *qué es correcto* en vez de *en qué orden llamar las cosas*, esa lógica se escapó de donde debería vivir (ver sección 5).
 
-El ViewModel es la pieza que absorbe toda la lógica de "cómo reflejar esto en pantalla" (loading, mapeo de errores a mensajes, combinar resultados de varios UseCases) sin que esa responsabilidad se filtre hacia arriba (UI) ni hacia abajo (Domain).
+Cómo se relacionan las piezas: `onEvent()` recibe el `Event` y despacha según su tipo (normalmente un `when`). Cada rama lanza una coroutine en `viewModelScope` (con `SupervisorJob`, para que el fallo de una no cancele a las demás), llama al `UseCase` correspondiente, y según el `Result` que devuelve, actualiza `_state` (con `.update { it.copy(...) }`) o emite un `_effect`.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness:** `WorkoutViewModel` encadena dos UseCases en una sola acción — `getActiveWorkoutUseCase()` para saber qué rutina está en curso, y después `startTimerUseCase(workout.id)` usando ese resultado. Encadenar así es orquestación legítima: el ViewModel decide *en qué orden* llamar las cosas, no *qué determina el resultado correcto* de cada una.
+
+**App de e-commerce:** `CheckoutViewModel` recibe `OnConfirmPayment`, pone `isProcessingPayment = true`, llama a `confirmPaymentUseCase()`, y según el `Result` mapea el error técnico (`PaymentDeclinedException`, `NetworkException`) a un mensaje que la UI puede mostrar directo — ese mapeo de "excepción técnica" a "texto entendible por un usuario" es trabajo típico del ViewModel, no del UseCase ni de la UI.
+
+## 4. Implementación real
+
+Retomando la app de delivery: armá `OrdersViewModel`, que arranca observando el historial local (reactivo, vía `Flow`) y expone la posibilidad de refrescar contra el backend.
 
 ```kotlin
-// PlayersViewModel.kt
-
-class PlayersViewModel(
-    private val getPlayersUseCase: GetPlayersUseCase,
-    private val deletePlayerUseCase: DeletePlayerUseCase
+class OrdersViewModel(
+    private val getOrderHistoryUseCase: GetOrderHistoryUseCase,
+    private val refreshOrdersUseCase: RefreshOrdersUseCase
 ) {
-    private val _state = MutableStateFlow(PlayersState())
-    val state: StateFlow<PlayersState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(OrdersState())
+    val state: StateFlow<OrdersState> = _state.asStateFlow()
 
-    private val _effect = MutableSharedFlow<PlayersEffect>()
-    val effect: SharedFlow<PlayersEffect> = _effect.asSharedFlow()
+    private val _effect = MutableSharedFlow<OrdersEffect>()
+    val effect: SharedFlow<OrdersEffect> = _effect.asSharedFlow()
 
     private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     init {
-        onEvent(PlayersEvent.OnRefresh)
+        observeOrderHistory()
+        onEvent(OrdersEvent.OnRefresh)
     }
 
-    fun onEvent(event: PlayersEvent) {
+    fun onEvent(event: OrdersEvent) {
         when (event) {
-            PlayersEvent.OnRefresh -> loadPlayers()
-            is PlayersEvent.OnPlayerClicked -> {
+            OrdersEvent.OnRefresh -> refreshOrders()
+            OrdersEvent.OnRetryClicked -> refreshOrders()
+            is OrdersEvent.OnOrderClicked -> {
                 viewModelScope.launch {
-                    _effect.emit(PlayersEffect.NavigateToDetail(event.id))
+                    _effect.emit(OrdersEffect.NavigateToOrderDetail(event.orderId))
                 }
             }
-            is PlayersEvent.OnDeleteClicked -> deletePlayer(event.id)
         }
     }
 
-    private fun loadPlayers() {
+    // El historial local es reactivo — se colecciona una sola vez, en init.
+    private fun observeOrderHistory() {
+        viewModelScope.launch {
+            getOrderHistoryUseCase().collect { orders ->
+                _state.update { it.copy(orders = orders) }
+            }
+        }
+    }
+
+    // El refresh es una acción puntual, disparada por Event — no un stream continuo.
+    private fun refreshOrders() {
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, error = null) }
 
-            when (val result = getPlayersUseCase()) {
-                is Result.Success -> _state.update {
-                    it.copy(players = result.data, isLoading = false)
+            when (val result = refreshOrdersUseCase()) {
+                is Result.Success -> _state.update { it.copy(isLoading = false) }
+                is Result.Error -> {
+                    _state.update { it.copy(isLoading = false) }
+                    _effect.emit(OrdersEffect.ShowSnackbar("No se pudo actualizar el historial"))
                 }
-                is Result.Error -> _state.update {
-                    it.copy(isLoading = false, error = result.exception.message)
-                }
-            }
-        }
-    }
-
-    private fun deletePlayer(id: String) {
-        viewModelScope.launch {
-            when (deletePlayerUseCase(id)) {
-                is Result.Success -> _effect.emit(PlayersEffect.ShowSnackbar("Jugador eliminado"))
-                is Result.Error -> _effect.emit(PlayersEffect.ShowSnackbar("No se pudo eliminar"))
             }
         }
     }
 }
 ```
 
-## 4. Matriz de criterio
+Notá la diferencia entre las dos coroutines de `init`: `observeOrderHistory()` colecciona un `Flow` que vive mientras el ViewModel exista — es la fuente reactiva de `orders`. `refreshOrders()` es una llamada puntual que termina — no actualiza `orders` directamente, porque eso lo hace `observeOrderHistory()` solo, apenas la base local cambia (mismo mecanismo de `repository_impl.md`).
 
-| Elemento | Usar cuando | NO usar cuando | Trade-off real |
-|---|---|---|---|
-| **`viewModelScope` con `SupervisorJob`** | Siempre — es el scope estándar de cualquier ViewModel MVI | — (no hay caso válido para omitirlo) | Un fallo en un `launch` no cancela a los demás; a cambio, cada `launch` necesita su propio manejo de error (try/catch o mapeo del `Result`), porque el scope ya no lo hace por vos |
-| **UseCase inyectado por constructor** | El ViewModel necesita ejecutar una regla de negocio (siempre) | El ViewModel accede a datos triviales sin regla de negocio real detrás (raro, pero si existe, se cuestiona si hace falta UseCase en absoluto — ver `02_domain/usecases.md`) | Testeable con `FakeUseCase`/`FakeRepository` sin mockear frameworks; a cambio, cada acción nueva de UI suele implicar un UseCase nuevo, más archivos |
-| **`init { }` disparando la carga inicial** | La pantalla necesita datos apenas se crea el ViewModel (caso más común) | La carga depende de un parámetro que llega después de la construcción (ej: un `playerId` de navegación) — ahí se dispara desde el primer `Event` o desde el `Composable` vía `LaunchedEffect`, no desde `init` | Simplicidad: no hace falta que la UI dispare un evento inicial; a cambio, dificulta testear el ViewModel de forma aislada si `init` ya dispara una coroutine — hay que controlar el `TestDispatcher` desde el primer momento |
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
 
-## 5. Caso trampa
+- **¿El `UseCase` llega por constructor, o el ViewModel lo instancia adentro?** Si el ViewModel arma su propio `RefreshOrdersUseCase(OrderRepositoryImpl(...))` en vez de recibirlo inyectado, se rompe la testeabilidad con fakes — mismo problema documentado en `04_di/que_resuelve_la_di.md`.
 
-**"El ViewModel llama a dos UseCases en `loadPlayers()`, ¿está bien que el segundo dependa del resultado del primero?"**
+- **¿Hay una decisión de negocio viviendo en el ViewModel en vez de en un UseCase?** Encadenar dos UseCases está bien (orquestación). El problema aparece si el ViewModel empieza a *decidir* algo — por ejemplo, "si el pedido tiene más de 3 items, aplicar descuento antes de confirmar". Esa es una regla de negocio que pertenece a `domain`, no a Presentation. La pregunta que desambigua: *¿esto es "en qué orden llamo las cosas" o "qué determina el resultado correcto"?*
 
-La respuesta obvia — "sí, es normal encadenar llamadas" — esconde una trampa de diseño frecuente. Si `SaveScoreUseCase` necesita el resultado de `GetActivePlayerUseCase` para saber a quién guardarle el puntaje, encadenar las dos llamadas dentro del ViewModel (`getActivePlayerUseCase()` y después `saveScoreUseCase(player.id, score)`) es habitual y está bien — es orquestación legítima, la responsabilidad del ViewModel.
+- **¿El `Flow` reactivo (`getOrderHistoryUseCase()`) se colecciona una sola vez en `init`, o se relanza en cada evento?** Relanzar la colección de un `Flow` reactivo cada vez que se dispara un `Event` genera colectores duplicados acumulándose — el `Flow` continuo va en `init`, las acciones puntuales van en las ramas de `onEvent`.
 
-La trampa aparece cuando esa cadena empieza a *decidir* algo (por ejemplo: "si el jugador activo tiene más de 100 puntos, aplicar bonus antes de guardar"). Esa decisión es una **regla de negocio**, no orquestación — y si vive suelta en el ViewModel en vez de en un UseCase (`SaveScoreWithBonusUseCase`, o una validación dentro de `SaveScoreUseCase`), se rompe la garantía de que toda regla de negocio está en Domain, testeable sin mockear ViewModel ni Compose. La pregunta que desambigua: *¿esto es "en qué orden llamo las cosas" (orquestación, va en ViewModel) o "qué determina el resultado correcto" (regla, va en UseCase)?*
+- **¿El error que llega a `State`/`Effect` es un mensaje entendible, o la excepción técnica cruda?** Si `_state.update { it.copy(error = e.message) }` expone directamente `e.message` de una `IOException` o `HttpException` sin traducir, la UI termina mostrando algo como "Unable to resolve host" en vez de "revisá tu conexión" — el mapeo de excepción técnica a mensaje de usuario es trabajo del ViewModel.
 
-## 6. Conexión con arquitectura real
-
-En Timbax, `PlayersViewModel` es exactamente el patrón del ejemplo: recibe `GetPlayersUseCase` y otros UseCases inyectados vía Koin con scope `viewModel` (ver `04_di/koin_fundamentos_y_scopes.md`), nunca instancia un `PlayerRepositoryImpl` directamente. El `Result` que devuelve cada UseCase es el mismo `sealed interface Result<out T>` de `02_domain/result_pattern.md` — el ViewModel es, de hecho, el único lugar de toda la app donde ese `Result` se "abre" con un `when` para decidir cómo actualizar el `State`; a partir de ahí, en toda capa hacia arriba (Compose), solo existe `PlayersState`, nunca un `Result` suelto.
+- **¿El `viewModelScope` usa `SupervisorJob`?** Sin él, el fallo de una coroutine (por ejemplo, el refresh) cancela el `Job` padre y con él cualquier otra coroutine en curso en el mismo scope — incluida la colección del `Flow` reactivo de `observeOrderHistory()`, que dejaría de recibir actualizaciones sin ningún error visible.
