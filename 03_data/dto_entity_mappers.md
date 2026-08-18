@@ -1,127 +1,113 @@
 # DTO / Entity / Mappers
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-DTO (Data Transfer Object) y Entity son los modelos "sucios" de la capa `data` — atados a una tecnología concreta y anotados con lo que esa tecnología necesita para funcionar. El **DTO** representa la forma en que un dato viaja por la red (`@Serializable` de Kotlinx Serialization, hablando con Ktor). La **Entity** representa la forma en que un dato se guarda en disco (`@Entity` de Room, o la clase generada por SQLDelight a partir de un `.sq`). Ninguno de los dos cruza jamás hacia `domain` ni hacia `presentation`/`UI` — el puente entre estos modelos "sucios" y el modelo de dominio puro (`Player`) lo hacen los **Mappers**: funciones de extensión que traducen de un lado al otro.
-
-```kotlin
-// data — DTO (viene de la red)
-@Serializable
-data class PlayerDto(
-    val id: String,
-    val name: String,
-    val score: Int
-)
-
-// data — Entity (vive en SQLDelight/Room)
-data class PlayerEntity(
-    val id: String,
-    val name: String,
-    val score: Long // SQLDelight guarda enteros como Long
-)
-
-// domain — Model puro (ya documentado en model.md)
-data class Player(
-    val id: String,
-    val name: String,
-    val score: Int
-)
-
-// data — Mapper
-fun PlayerDto.toDomain(): Player = Player(id = id, name = name, score = score)
-fun PlayerEntity.toDomain(): Player = Player(id = id, name = name, score = score.toInt())
-fun Player.toEntity(): PlayerEntity = PlayerEntity(id = id, name = name, score = score.toLong())
+```mermaid
+flowchart LR
+    API[("Backend (JSON)")] --> DTO["DTO<br/>@Serializable"]
+    LOCAL[("Base local")] --> ENT["Entity<br/>@Entity / .sq"]
+    DTO -- "mapper .toDomain()" --> DOM["Domain Model<br/>puro Kotlin"]
+    ENT -- "mapper .toDomain()" --> DOM
+    DOM -- "mapper .toEntity()" --> ENT
 ```
 
-## 2. El problema que resuelve
+A diferencia de los diagramas anteriores (una cadena de llamadas de arriba a abajo), acá el dato converge desde dos orígenes distintos hacia un único punto de encuentro: el Domain Model. Este archivo es zoom sobre las flechas del diagrama, no sobre los nodos — el Mapper es la flecha, no la caja.
 
-Si `Player` (el modelo de dominio) tuviera directamente las anotaciones `@Serializable` o `@Entity`, domain dejaría de ser "puro Kotlin sin dependencias externas" — pasaría a depender de Kotlinx Serialization o de Room/SQLDelight, dos tecnologías que domain no debería ni conocer. Peor todavía: un cambio en la forma en que la API entrega el JSON (por ejemplo, que agregue un campo `avatar_url` que a domain no le importa) terminaría forzando cambios en cascada sobre `UseCases`, `ViewModels` y hasta la UI, cuando en realidad ese cambio debería quedar totalmente contenido dentro de la capa `data`. DTO/Entity + Mappers resuelven esto separando "cómo llega/se guarda el dato" de "qué es el dato para el negocio" — cada capa habla su propio idioma, y los mappers son los únicos que entienden los dos.
+## 2. Qué es y cómo funciona
 
-## 3. Ejemplo mínimo comentado
+DTO y Entity son los modelos "sucios" de la capa `data` — cada uno atado a una tecnología concreta:
+
+- **DTO** (Data Transfer Object) — la forma exacta en que un dato viaja por la red. Anotado con `@Serializable` (Kotlinx Serialization), habla el idioma del backend: nombres de campo en `snake_case`, campos opcionales que domain quizás ni necesita.
+- **Entity** — la forma exacta en que un dato se guarda en disco. Anotada con `@Entity` (Room) o generada desde un `.sq` (SQLDelight), habla el idioma de la tabla: tipos que la base entiende, no necesariamente los mismos que el dominio.
+- **Domain Model** — el tipo puro, sin anotaciones de ninguna tecnología, que circula por `domain` y `presentation`.
+- **Mapper** — la función de extensión que traduce de un lado al otro: `DtoX.toDomain()`, `EntityX.toDomain()`, `DomainX.toEntity()`. Siempre nombrada `algo.toX()`, nunca al revés (nunca `Order.fromDto(dto)` como función estática) — el mapper queda pegado a quien lo origina.
+
+Ninguno de los dos modelos sucios cruza jamás hacia `domain` ni hacia la UI — es el Mapper el único que conoce ambos idiomas a la vez.
+
+## 3. Cómo se ve en distintos contextos
+
+**App de e-commerce:** el `ProductDto` que devuelve el backend trae un campo `internal_sku_code` que el negocio nunca muestra ni usa en ninguna regla — el mapper simplemente no lo copia al `Product` de dominio. El dato existe en el DTO, existe en el JSON, pero muere ahí — domain ni se entera de que existió.
+
+**App de fitness:** un caso más interesante de conversión de tipos, no solo de descarte: el `WorkoutDto` trae la fecha como string ISO-8601 (`"2026-08-15T10:30:00Z"`), la `WorkoutEntity` la guarda como epoch millis (`Long`, lo que la tabla entiende), y el `Workout` de dominio la expone como `Instant` (el tipo con el que el resto de la app realmente trabaja). Tres representaciones distintas del mismo dato, tres mappers distintos, y ninguna de las tres capas necesita saber cómo hacen las otras dos su parte.
+
+## 4. Implementación real
+
+Retomando la app de delivery: el backend te devuelve el historial de pedidos con la fecha en formato ISO-8601 y los nombres de campo en `snake_case`. La base local (de `room_persistencia.md`/`sqldelight_persistencia_local.md`) ya guarda `placedAt` como `Instant` directamente. El domain necesita `Order`, sin saber nada de ninguna de las dos fuentes.
+
+**Paso 1 — el DTO, con la forma exacta del JSON del backend:**
 
 ```kotlin
-// DTO: forma exacta del JSON que devuelve la API. Puede tener campos que domain ni necesita.
 @Serializable
-data class PlayerDto(
+data class OrderDto(
     val id: String,
-    val name: String,
-    val score: Int,
-    @SerialName("avatar_url") val avatarUrl: String? = null // domain no lo usa, se descarta acá
+    @SerialName("restaurant_name") val restaurantName: String,
+    @SerialName("placed_at") val placedAt: String, // ISO-8601: "2026-08-15T10:30:00Z"
+    val items: List<OrderItemDto>
 )
 
-// Entity: forma exacta de la tabla en SQLDelight/Room.
-data class PlayerEntity(
-    val id: String,
-    val name: String,
-    val score: Long
-)
-
-// Mapper DTO -> Domain: se descarta lo que domain no necesita (avatarUrl)
-fun PlayerDto.toDomain(): Player = Player(
-    id = id,
-    name = name,
-    score = score
-)
-
-// Mapper Domain -> Entity: se adapta el tipo (Int -> Long) que pide SQLDelight
-fun Player.toEntity(): PlayerEntity = PlayerEntity(
-    id = id,
-    name = name,
-    score = score.toLong()
-)
-
-// Mapper Entity -> Domain: camino inverso, para cuando se lee de la DB
-fun PlayerEntity.toDomain(): Player = Player(
-    id = id,
-    name = name,
-    score = score.toInt()
+@Serializable
+data class OrderItemDto(
+    @SerialName("item_name") val itemName: String,
+    val quantity: Int
 )
 ```
 
-El patrón se repite siempre igual: `algo.toX()`, donde `X` es la capa destino. Nunca al revés (nunca `Player.fromDto(dto)` como función estática) — como extension function, el mapper queda pegado a quien lo origina, no a quien lo recibe.
-
-## 4. Matriz de criterio
-
-**Mapper como extension function (`Dto.toDomain()`):**
-- Usar cuando: es el caso general — mappers simples, 1 a 1, sin dependencias externas para hacer la conversión.
-- NO usar cuando: el mapeo necesita contexto externo para resolverse (ej: convertir un `score` relativo a absoluto necesitando el `GameConfig` actual) — ahí conviene una función normal que reciba ese contexto como parámetro, en vez de forzarlo en una extension function.
-- Trade-off: extension functions son livianas y muy legibles en el punto de uso (`dto.toDomain()`), pero si el mapeo se vuelve complejo (múltiples fuentes, lógica condicional pesada) mezclarlo todo en una sola función extension puede volverse difícil de testear en aislamiento — ahí vale la pena promoverlo a una clase `Mapper` con su propio test.
-
-**Un DTO/Entity por tecnología, sin reusar el mismo modelo para las dos:**
-- Usar cuando: siempre — aunque `PlayerDto` y `PlayerEntity` terminen teniendo exactamente los mismos campos hoy, son conceptualmente cosas distintas (uno describe un contrato de red, el otro un esquema de tabla) y evolucionan por razones distintas.
-- NO usar cuando: prácticamente nunca conviene "ahorrarse" esta separación — es una trampa común de proyectos chicos que después cuesta desarmar cuando el DTO y la Entity empiezan a divergir de verdad.
-- Trade-off: parece código duplicado al principio (dos clases casi idénticas), pero esa "duplicación" es la que evita que un cambio en el JSON de la API rompa el schema de la DB, o viceversa.
-
-**Descartar campos en el mapper vs. traerlos igual a domain "por las dudas":**
-- Usar cuando: domain solo debería tener las propiedades que el negocio realmente usa — si `avatarUrl` no se usa en ninguna regla de negocio ni se muestra en UI todavía, no entra a `Player`.
-- NO usar cuando: si un campo hoy no se usa pero se sabe con certeza que se va a necesitar pronto (no "por las dudas" especulativo), ahí sí tiene sentido agregarlo a domain de una.
-- Trade-off: ser estricto acá mantiene `Player` limpio y con propósito claro, pero implica tocar el mapper (y potencialmente el modelo de domain) cada vez que una nueva necesidad de negocio aparece — es el costo aceptado de mantener domain puro.
-
-## 5. Caso trampa
-
-Un mapper que parece inofensivo pero esconde pérdida silenciosa de datos:
+**Paso 2 — el Domain Model, puro:**
 
 ```kotlin
-// DTO real que devuelve la API — score puede venir null si el jugador nunca jugó
-@Serializable
-data class PlayerDto(
+data class Order(
     val id: String,
-    val name: String,
-    val score: Int? // nullable en el contrato real de la API
+    val restaurantName: String,
+    val placedAt: Instant,
+    val items: List<OrderItem>
 )
 
-// ❌ trampa: el mapper "resuelve" el null con un default silencioso
-fun PlayerDto.toDomain(): Player = Player(
-    id = id,
-    name = name,
-    score = score ?: 0 // ¿es 0 lo mismo que "nunca jugó"? el mapper decidió que sí, sin que nadie lo pida
-)
+data class OrderItem(val itemName: String, val quantity: Int)
 ```
 
-El código compila, no lanza excepciones, y en la mayoría de los tests "funciona". El problema es semántico: el mapper tomó una decisión de negocio (tratar "sin score" como "score cero") que en realidad le correspondía a domain o a una regla explícita, no a una conversión de tipos. Si más adelante alguien agrega una feature de ranking, un jugador que "nunca jugó" (score null) va a aparecer empatado en el último lugar con uno que efectivamente sacó 0 puntos jugando — son casos distintos que el mapper fusionó sin que quede rastro de la decisión en ningún lado.
+**Paso 3 — mapper DTO → Domain, donde ocurre la conversión de tipos real** (`String` ISO-8601 → `Instant`):
 
-La regla: si un mapper necesita "inventar" un valor por default para resolver un null, esa decisión tiene que ser explícita y visible — o modelarse en domain (`score: Int?` también ahí, si "sin jugar" es un estado real del negocio), o resolverse en un UseCase donde la regla quede documentada, no escondida dentro de una extension function de una línea.
+```kotlin
+fun OrderDto.toDomain(): Order = Order(
+    id = id,
+    restaurantName = restaurantName,
+    placedAt = Instant.parse(placedAt),
+    items = items.map { it.toDomain() }
+)
 
-## 6. Conexión
+fun OrderItemDto.toDomain(): OrderItem = OrderItem(itemName = itemName, quantity = quantity)
+```
 
-En Timbax, cada fuente de datos (`PlayerApi` para lo que eventualmente sincroniza con backend, `PlayerDao`/SQLDelight para lo local) tiene su propio DTO/Entity, y `PlayerRepositoryImpl` (visto en `repository_impl.md`) es quien invoca estos mappers en cada punto de entrada/salida — nunca expone un DTO o Entity fuera de sus propios métodos. Esto conecta directo con la Dependency Rule del machete: los mappers son el mecanismo concreto que hace cumplir "nadie fuera de `data` debería saber si un dato vino de una API o de una tabla SQL" — el `Player` que llega a un `UseCase` es siempre el mismo tipo, sin importar cuál mapper lo produjo.
+**Paso 4 — mapper Entity → Domain, donde esta vez casi no hay conversión** (la `Entity` ya guarda `placedAt` como `Instant`, gracias al `@TypeConverter`/columna correspondiente visto en el archivo de persistencia):
+
+```kotlin
+fun OrderWithItems.toDomain(): Order = Order(
+    id = order.id,
+    restaurantName = order.restaurantName,
+    placedAt = order.placedAt, // ya es Instant, sin conversión acá
+    items = items.map { it.toDomain() }
+)
+
+fun OrderItemEntity.toDomain(): OrderItem = OrderItem(itemName = itemName, quantity = quantity)
+```
+
+**Paso 5 — mapper Domain → Entity, para guardar en local lo que llegó de la red:**
+
+```kotlin
+fun Order.toEntity(): OrderEntity = OrderEntity(id = id, restaurantName = restaurantName, placedAt = placedAt)
+
+fun OrderItem.toEntity(orderId: String): OrderItemEntity =
+    OrderItemEntity(orderId = orderId, itemName = itemName, quantity = quantity)
+```
+
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
+
+- **¿El mapper "resuelve" un valor nulo o inesperado con un default silencioso?** Ejemplo clásico: si `quantity` viniera nullable del backend y el mapper hiciera `quantity ?: 1`, esa es una decisión de negocio (¿un item sin cantidad especificada es "uno"?) escondida en una línea de conversión de tipos. Si la IA agregó un `?:` para "que compile", confirmá que esa decisión es realmente la que el negocio quiere, y que quede visible, no enterrada.
+
+- **¿Hay una clase DTO y una Entity separadas, aunque hoy tengan los mismos campos?** Es tentador "ahorrarse" la duplicación cuando `OrderDto` y `OrderEntity` se ven idénticos. No lo hagas: son conceptualmente distintos (uno es un contrato de red, el otro un esquema de tabla) y el día que uno cambie sin el otro, la separación ya construida evita que ese cambio se propague donde no corresponde.
+
+- **¿El `Instant.parse(placedAt)` está protegido contra un formato inesperado?** Si el backend manda una fecha mal formada en un solo item de una lista de cien, `Instant.parse` lanza una excepción — sin un `try/catch` o una validación previa, ese único item corrompido puede tirar abajo el mapeo de toda la lista, no solo el suyo.
+
+- **¿El mapper es una extension function del origen hacia el destino, o una función que rompe esa dirección?** `fun OrderDto.toDomain(): Order`, nunca `fun Order.Companion.fromDto(dto: OrderDto): Order`. La convención importa porque hace que el mapper viva pegado a quien lo origina — más fácil de encontrar, más fácil de auditar.
+
+- **¿Hay lógica de negocio real (cálculos, validaciones, reglas condicionales) mezclada dentro del mapper?** Un mapper debería ser una traducción de campos, no el lugar donde se decide una regla de negocio. Si el mapper que te entregó la IA tiene un `if` que decide algo más que "cómo convertir un tipo a otro", esa lógica probablemente pertenece a un `UseCase`, no acá.

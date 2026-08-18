@@ -1,77 +1,82 @@
-# koin_fundamentos_y_scopes.md
+# Koin (fundamentos y scopes)
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Koin es el framework de Inyección de Dependencias más usado en KMP. A diferencia de Dagger/Hilt, resuelve el grafo de dependencias **en runtime** (no genera código en compile-time vía KSP/annotation processing) — es 100% Kotlin puro, sin reflexión pesada ni generación de código, lo que lo hace liviano y portable a cualquier target de KMP (Android, iOS, Desktop, Web).
-
-Se organiza en **módulos** (`module { }`), donde cada dependencia se declara con un **scope** que define su ciclo de vida: `single`, `factory` o `viewModel`.
-
-## 2. El problema que resuelve
-
-Ya vimos en `que_resuelve_la_di.md` el problema genérico de DI. Koin resuelve, puntualmente, **cómo construir el grafo completo de la app sin acoplarse a Android** (a diferencia de Hilt) y **sin pagar el costo de compile-time** (a diferencia de Dagger). Sin un framework, cada punto de entrada de la app (el `MainActivity`, el `App.swift`, el entrypoint de Desktop) tendría que ensamblar a mano toda la cadena de dependencias:
-
-```kotlin
-// Sin Koin: ensamblar el grafo a mano en cada entrypoint
-val dao = PlayerDao(DatabaseProvider.getInstance())
-val repository = PlayerRepositoryImpl(dao)
-val getPlayersUseCase = GetPlayersUseCase(repository)
-val viewModel = PlayersViewModel(getPlayersUseCase)
+```mermaid
+flowchart TD
+    START["startKoin { modules(appModule) }<br/>una sola vez, en el entrypoint"] --> MOD["Módulo declarado<br/>single / factory / viewModel"]
+    ASK["Algo pide una dependencia<br/>koinViewModel() / get()"] --> MOD
+    MOD -- "resuelve get() en cadena" --> CHAIN["ViewModel ← UseCase ← Repository ← Dao"]
 ```
 
-Esto se vuelve insostenible cuando hay decenas de dependencias y varias pantallas — cada una necesitaría repetir parte de esta cadena. Koin centraliza esa construcción en módulos declarativos, y resuelve el grafo automáticamente cuando algo pide una dependencia.
+Este es el mismo mapa del archivo anterior (`que_resuelve_la_di.md`), con el contenedor genérico reemplazado por la implementación concreta: Koin.
 
-## 3. Ejemplo mínimo comentado
+## 2. Qué es y cómo funciona
+
+Koin es el framework de DI más usado en KMP. A diferencia de Dagger/Hilt, resuelve el grafo de dependencias **en runtime** — no genera código en compile-time vía KSP, es 100% Kotlin puro, sin reflexión pesada, lo que lo hace liviano y portable a cualquier target (Android, iOS, Desktop, Web).
+
+Se organiza en **módulos** (`module { }`), donde cada dependencia se declara con un **scope** que define su ciclo de vida:
+
+- **`single`** — una única instancia compartida en toda la app (`HttpClient`, `Database`, un `Repository` sin estado por-pantalla).
+- **`factory`** — una instancia nueva cada vez que se pide — típicamente `UseCase`s sin estado propio.
+- **`viewModel`** — específico para ViewModels; Koin lo ata al ciclo de vida correcto de cada plataforma.
+
+Cómo se relacionan las piezas: dentro de un módulo, `get()` le dice a Koin "resolvé esta dependencia con lo que ya está declarado en el grafo" — no hace falta pasarla a mano, Koin la busca por tipo. `startKoin { modules(...) }` arranca el contenedor una sola vez, típicamente en el entrypoint de cada plataforma. A partir de ahí, cualquier punto de la app que pida una dependencia (`koinViewModel()` en un composable, `by inject()`, `get()`) dispara la resolución de toda la cadena necesaria.
+
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness:** el módulo completo de la feature de rutinas encadena cuatro piezas: `single { WorkoutDao(get()) }`, `single<WorkoutRepository> { WorkoutRepositoryImpl(get()) }`, `factory { GetWorkoutsUseCase(get()) }`, `viewModel { WorkoutsViewModel(get()) }`. Pedir el `ViewModel` dispara la resolución de las cuatro, en cadena, sin que nadie tenga que ensamblarlas a mano.
+
+**App de e-commerce (testing):** en un test de integración del flujo de compra, se reemplaza el `PaymentGateway` real por un fake sin tocar ninguna clase de producción — se arma un `koinApplication` de test con un módulo que sobreescribe la declaración real: `module { single<PaymentGateway> { FakePaymentGateway() } }`. Koin resuelve todo lo demás igual, pero cualquier clase que pida `PaymentGateway` recibe el fake.
+
+## 4. Implementación real
+
+Retomando la app de delivery: armá el módulo de Koin completo para la feature de Historial de Pedidos, encadenando persistencia local, red, y presentación.
 
 ```kotlin
-// Definición del módulo (comúnmente en di/AppModule.kt)
-val appModule = module {
-    single<PlayerRepository> { PlayerRepositoryImpl(get()) } // singleton, una sola instancia en toda la app
-    single { PlayerDao(get()) }                               // get() resuelve la dependencia de PlayerDao automáticamente
-    factory { GetPlayersUseCase(get()) }                       // nueva instancia cada vez que se pide
-    viewModel { PlayersViewModel(get()) }                      // scope atado al ciclo de vida del ViewModel
+val orderModule = module {
+    // Local
+    single { AppDatabase.Schema } // o el equivalente de Room
+    single { get<AppDatabase>().orderDao() }
+
+    // Remoto
+    single { createHttpClient(engine = get()) }
+    single { OrderApiService(get()) }
+
+    // Data layer
+    single<OrderRepository> { OrderRepositoryImpl(dao = get(), api = get()) }
+
+    // Domain
+    factory { GetOrderHistoryUseCase(get()) }
+    factory { RefreshOrdersUseCase(get()) }
+
+    // Presentation
+    viewModel { OrdersViewModel(getOrderHistory = get(), refreshOrders = get()) }
 }
 
-// Arranque de Koin (una sola vez, en el entrypoint de cada plataforma)
+// androidMain — el engine específico de esta plataforma se declara en su propio módulo
+val androidOrderModule = module {
+    single<HttpClientEngine> { OkHttp.create() }
+}
+
+// Arranque, en el entrypoint de cada plataforma
 fun initKoin() {
     startKoin {
-        modules(appModule)
+        modules(orderModule, androidOrderModule)
     }
 }
-
-// Consumo dentro de un composable (Android/KMP)
-@Composable
-fun PlayersScreen(viewModel: PlayersViewModel = koinViewModel()) {
-    // Koin resuelve automáticamente toda la cadena: 
-    // PlayersViewModel <- GetPlayersUseCase <- PlayerRepository <- PlayerDao
-}
 ```
 
-`get()` dentro de un módulo le dice a Koin "resolvé esta dependencia usando lo que ya está declarado en el grafo" — no hace falta pasarla a mano, Koin la busca por tipo.
+`OrdersViewModel` nunca sabe que existe `OrderApiService` ni `AppDatabase` — solo declara los dos `UseCase`s que necesita, y Koin resuelve el resto de la cadena por debajo.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
 
-| Scope | Cuándo usarlo | Cuándo NO usarlo |
-|---|---|---|
-| `single` | Dependencias que deben ser una única instancia compartida en toda la app: `HttpClient`, `Database`, `Repository` (si no tiene estado por-pantalla) | Si necesitás una instancia nueva cada vez (ej: un `UseCase` con estado interno mutable, poco común pero posible) |
-| `factory` | Objetos livianos que no tiene sentido compartir — típicamente `UseCase`s sin estado propio | Si el objeto es costoso de crear (ej: una conexión de red) — ahí conviene `single` |
-| `viewModel` | Específico para ViewModels — Koin lo ata al ciclo de vida correcto de la plataforma (`ViewModelStoreOwner` en Android, equivalente en KMP) | Para cualquier clase que no sea un ViewModel — usar `single`/`factory` según corresponda |
+- **¿El scope elegido es el correcto para cada dependencia?** Una clase con estado mutable interno declarada como `single` comparte ese estado entre todos los lugares de la app que la inyecten — un bug de concurrencia silencioso. La regla: si la clase tiene estado mutable propio no intencionalmente compartido, casi nunca debería ser `single`.
 
-**Trade-off real de Koin vs Dagger/Hilt** (se profundiza en `dagger_hilt_vs_koin.md`): Koin resuelve el grafo en runtime, lo que significa que un error de dependencia faltante **no se detecta hasta ejecutar la app** (crash en runtime), mientras que Dagger lo detecta en compile-time. Es el precio que se paga por la portabilidad multiplataforma y la simplicidad de setup.
+- **¿El módulo nuevo está efectivamente agregado a `modules(...)` en el `startKoin`?** Koin resuelve en runtime, así que un módulo declarado pero nunca importado no da error de compilación — recién falla cuando algo intenta pedir esa dependencia y Koin no la encuentra (`NoDefinitionFoundException` en producción, en el peor momento). Si la IA te agregó un módulo nuevo, confirmá que también lo sumó a la lista de `modules(...)`.
 
-## 5. Caso trampa
+- **¿Hay una dependencia circular entre `single`s?** Si `A` necesita `B` y `B` necesita `A` en sus constructores, Koin no lo detecta hasta que efectivamente se intenta resolver esa cadena — y ahí sí falla en runtime. El compilador no te va a avisar como sí lo haría Dagger.
 
-**"Declaré la dependencia en el módulo, así que ya está inyectada correctamente."**
+- **¿`get()` resuelve el tipo correcto cuando hay más de una implementación de la misma interfaz?** Si el proyecto tiene dos `HttpClient` distintos (uno para el backend propio, otro para un servicio de terceros), un `get()` sin calificar puede resolver el que no corresponde — hace falta usar `named()`/qualifiers para desambiguar, y vale la pena confirmar que la IA no los mezcló.
 
-Declarar en el módulo no alcanza si el **scope elegido es el incorrecto**. Un error común: usar `single` para algo que en realidad necesita ser `factory`.
-
-```kotlin
-// Trampa: un UseCase declarado como single que internamente guarda estado mutable
-single { ValidateScoreUseCase() } // si ValidateScoreUseCase tiene un `var lastError: String? = null` interno,
-                                    // ese estado se comparte entre TODAS las pantallas que lo usen simultáneamente
-```
-
-Si `ValidateScoreUseCase` guarda estado mutable interno y se declara `single`, ese estado queda compartido entre todos los lugares de la app que lo inyecten — un bug de concurrencia difícil de rastrear, porque el código "compila y funciona" en el caso simple de una sola pantalla usándolo a la vez. La regla práctica: si la clase tiene estado mutable propio, casi nunca debería ser `single` salvo que ese estado compartido sea intencional (como un `Repository` con cache en memoria).
-
-## 6. Conexión con arquitectura real
-
-En Timbax, el módulo de Koin es el único lugar del proyecto donde se importa `PlayerRepositoryImpl` (la implementación concreta) junto con `PlayerRepository` (la interfaz de `domain`) — ninguna otra clase conoce ambas cosas a la vez. Esto es la continuación directa de lo que se explicó en `que_resuelve_la_di.md`: el módulo de DI es el punto de conexión entre la capa `data` y la capa `domain`, respetando la Dependency Rule sin que ninguna clase de negocio importe algo de infraestructura.
+- **¿La UI consume el ViewModel vía `koinViewModel()` (o el mecanismo de Koin equivalente), o hay algún lugar donde se instancia a mano?** Un `PlayersViewModel()` instanciado directo en un composable, en vez de resuelto por Koin, rompe silenciosamente el grafo de DI en ese punto puntual — compila, pero esa instancia queda fuera del ciclo de vida y del scope que el resto de la app espera.

@@ -1,87 +1,82 @@
 # Qué resuelve la Inyección de Dependencias
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-La Inyección de Dependencias (DI) es un patrón donde una clase **recibe** las dependencias que necesita en vez de **crearlas ella misma**. La responsabilidad de construir e "inyectar" esas dependencias se delega a algo externo (un framework de DI, o incluso construcción manual pasada por constructor).
+```mermaid
+flowchart TD
+    START["Entrypoint de la app<br/>(MainActivity / App.swift / main)"] --> INIT["Se arranca el contenedor de DI<br/>una sola vez"]
+    INIT --> GRAPH["Grafo de dependencias<br/>declarado en módulos"]
+    GRAPH -. "get() / by inject()" .-> CONSUMER["Clase que necesita una dependencia<br/>(ViewModel, Repository, etc.)"]
+    CONSUMER -- "declara qué necesita, nunca cómo se construye" --> GRAPH
+```
 
-No es una librería — es el patrón. Koin, Dagger/Hilt y Kodein son tres formas distintas de *implementar* ese patrón, pero el problema que resuelven es el mismo, y existe incluso sin usar ninguna de las tres (pasar dependencias por constructor a mano ya es DI).
+Este archivo es sobre el patrón en sí, antes de cualquier framework concreto (Koin, Hilt, Kodein) — esos son formas distintas de implementar exactamente este mapa.
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Sin DI, cada clase construye sus propias dependencias internamente:
+La Inyección de Dependencias (DI) es un patrón donde una clase **recibe** las dependencias que necesita en vez de **crearlas ella misma**. No es una librería — es el patrón en sí. Koin, Dagger/Hilt y Kodein son tres formas distintas de implementarlo, pero el problema que resuelven es el mismo, y existe incluso sin usar ninguna de las tres (pasar dependencias por constructor a mano ya es DI).
+
+Sin DI, cada clase construye sus propias dependencias internamente — y eso genera tres problemas concretos: **acoplamiento rígido** (la clase conoce cómo se construye cada cosa que usa, y un cambio ahí obliga a tocar cada punto que la instancia a mano), **imposibilidad de testear en aislamiento** (no hay forma de reemplazar una dependencia por un fake si está hardcodeada adentro), y **nadie sabe "quién construye qué"** (en un proyecto grande, sin un lugar centralizado, no existe una vista única del grafo de objetos de la app).
+
+Cómo se relacionan las piezas: la **clase consumidora** declara por constructor lo que necesita (una interfaz, idealmente, no una implementación concreta). El **contenedor/módulo de DI** es quien sabe cómo construir cada pieza del grafo, y se arranca una sola vez en el entrypoint de la app. Cuando algo pide una dependencia (`get()`, `by inject()`, o el mecanismo que sea), el contenedor resuelve la cadena completa — la clase consumidora nunca sabe de dónde vino lo que recibió.
+
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness:** un `WorkoutViewModel` necesita un repositorio de rutinas. Sin DI, el `ViewModel` instancia `WorkoutRepositoryImpl(RoomDatabase.getInstance(context))` en su propio constructor — acoplado a Room, a `Context`, y a la forma exacta de construir la base. Con DI, el `ViewModel` solo declara `WorkoutRepository` (la interfaz) como parámetro de constructor, y no le importa qué hay detrás.
+
+**App de notas (testing):** una clase `SearchNotesUseCase` que recibe su `NotesRepository` por constructor se puede testear pasándole un `FakeNotesRepository` que devuelve datos fijos en memoria — sin levantar una base de datos real, sin mockear frameworks pesados. Sin DI, si el `UseCase` instanciara su propio repositorio adentro, ese test sería imposible de aislar.
+
+## 4. Implementación real
+
+Te piden: *"La clase `PriceCalculator` hoy instancia su propia conexión a una API de tipo de cambio adentro del constructor, y el equipo no puede testearla sin hacer llamadas de red reales. Refactorizala para que sea testeable."*
+
+**Antes — acoplada, no testeable:**
 
 ```kotlin
-class PlayerRepositoryImpl {
-    private val dao = PlayerDao(DatabaseProvider.getInstance()) // la clase se arma sus propias dependencias
+class PriceCalculator {
+    private val exchangeRateApi = ExchangeRateApiClient(HttpClientProvider.getInstance())
+    // ^ la clase se arma su propia dependencia — no hay forma de reemplazarla en un test
+
+    suspend fun convertToLocalCurrency(amountUsd: Double): Double {
+        val rate = exchangeRateApi.getCurrentRate()
+        return amountUsd * rate
+    }
 }
 ```
 
-Esto genera tres problemas concretos:
-
-- **Acoplamiento rígido**: `PlayerRepositoryImpl` ahora conoce `DatabaseProvider` y cómo se construye un `PlayerDao`. Si mañana cambia la forma de crear el DAO, hay que tocar cada clase que lo instancia a mano.
-- **Imposible testear en aislamiento**: no hay forma de reemplazar `dao` por un fake en un test — está hardcodeado adentro. Para testear `PlayerRepositoryImpl` termina siendo necesario levantar una base de datos real.
-- **Nadie sabe "quién construye qué"**: en un proyecto grande, si cada clase arma sus dependencias donde las necesita, no existe un lugar único donde ver el grafo de objetos de la app.
-
-DI invierte esto: la clase declara qué necesita (por constructor), y algo externo se encarga de proveerlo.
+**Después — la dependencia entra por constructor:**
 
 ```kotlin
-class PlayerRepositoryImpl(private val dao: PlayerDao) : PlayerRepository {
-    // la clase ya no sabe CÓMO se construye un PlayerDao, solo que lo recibe
+class PriceCalculator(
+    private val exchangeRateApi: ExchangeRateApi // interfaz, no la implementación concreta
+) {
+    suspend fun convertToLocalCurrency(amountUsd: Double): Double {
+        val rate = exchangeRateApi.getCurrentRate()
+        return amountUsd * rate
+    }
 }
+
+// En producción, un framework de DI (o el entrypoint) decide qué implementación pasar
+val calculator = PriceCalculator(exchangeRateApi = ExchangeRateApiClient(httpClient))
+
+// En un test, se pasa un fake sin tocar la clase real
+class FakeExchangeRateApi : ExchangeRateApi {
+    override suspend fun getCurrentRate(): Double = 1.0 // tasa fija, sin red
+}
+
+val calculatorEnTest = PriceCalculator(exchangeRateApi = FakeExchangeRateApi())
 ```
 
-## 3. Ejemplo mínimo comentado
+`PriceCalculator` ya no decide **de dónde** viene su `ExchangeRateApi` — eso lo decide quien la construye.
 
-```kotlin
-// Sin DI: PlayerRepositoryImpl decide y construye su propia dependencia
-class PlayerRepositoryImplSinDI : PlayerRepository {
-    private val dao = PlayerDao(DatabaseProvider.getInstance()) // acoplado, no testeable
-    override fun getPlayers(): Flow<List<Player>> = dao.getAll().map { it.toDomain() }
-}
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
 
-// Con DI: la dependencia entra por constructor, algo externo decide qué instancia pasar
-class PlayerRepositoryImplConDI(
-    private val dao: PlayerDao // "inyectada", no creada acá
-) : PlayerRepository {
-    override fun getPlayers(): Flow<List<Player>> = dao.getAll().map { it.toDomain() }
-}
+- **¿La dependencia llega como interfaz, o como implementación concreta?** `PriceCalculator(exchangeRateApi: ExchangeRateApiClient)` (la clase concreta) sigue acoplando al consumidor a una implementación específica, aunque técnicamente "entre por constructor". El punto de DI es poder cambiar la implementación sin tocar al consumidor — eso solo funciona si el tipo del parámetro es una interfaz/abstracción.
 
-// En un test, ahora se puede pasar un fake sin tocar la clase real
-class FakePlayerDao : PlayerDao {
-    override fun getAll(): Flow<List<PlayerEntity>> = flowOf(emptyList())
-}
+- **¿Hay un *default value* que sigue construyendo la dependencia real adentro del constructor?** `class Foo(private val repo: Repository = RepositoryImpl(RealDatabase.instance))` "acepta" la dependencia, pero si nadie pasa el parámetro explícitamente (como en un test que se olvida de hacerlo), se sigue instanciando la implementación real. El acoplamiento no desapareció, se escondió un nivel más adentro.
 
-val repositoryEnTest = PlayerRepositoryImplConDI(dao = FakePlayerDao())
-```
+- **¿La clase importa, en algún punto interno, la implementación concreta de algo que ya recibe por constructor?** Si `PriceCalculator` recibe `ExchangeRateApi` por constructor pero en algún método interno hace `ExchangeRateApiClient()` de nuevo "para un caso puntual", el acoplamiento reaparece por la puerta de atrás.
 
-La diferencia no es sintáctica — es que `PlayerRepositoryImplConDI` ya no decide **de dónde** viene su `PlayerDao`. Eso lo decide quien lo construye (un framework de DI, o directamente el test).
+- **¿Hay un singleton global (`object`, `companion object` con estado, service locator estático) actuando como sustituto informal de DI?** Un `object DatabaseProvider { val instance = ... }` accedido directamente desde varias clases tiene el mismo problema que no tener DI — nadie puede reemplazarlo en un test, aunque no se vea tan obvio como un `new` directo en el constructor.
 
-## 4. Matriz de criterio
-
-| Escenario | Con DI (framework o manual) | Sin DI |
-|---|---|---|
-| Testear una clase en aislamiento | Se pasa un fake/mock por constructor sin tocar la clase | Requiere levantar la dependencia real (DB, red) o hacer la clase testeable a posteriori |
-| Cambiar la implementación de una dependencia (ej: SQLDelight → Room) | Se cambia en un solo lugar (el módulo de DI) | Hay que tocar cada clase que instancia esa dependencia directamente |
-| Proyecto chico, un solo desarrollador, prototipo descartable | Puede no justificarse el overhead de configurar un framework — DI manual por constructor alcanza | — |
-| Proyecto que va a crecer o va a portfolio | Vale la pena un framework (Koin) desde el principio, más barato que migrar después | El costo de refactorizar todo a DI cuando ya creció es mucho mayor |
-
-**El trade-off real no es "usar DI sí o no"** — DI manual (pasar dependencias por constructor sin ningún framework) ya es DI y en proyectos chicos puede ser suficiente. El framework (Koin, Dagger/Hilt) entra cuando el grafo de dependencias crece lo suficiente como para que armarlo a mano en cada punto de entrada de la app se vuelva repetitivo y propenso a error.
-
-## 5. Caso trampa
-
-**"Mi clase recibe la dependencia por constructor, así que ya está usando DI correctamente."**
-
-Recibir por constructor es condición necesaria, pero no suficiente. Si en algún punto de la cadena alguien sigue haciendo esto:
-
-```kotlin
-class PlayersViewModel(
-    private val repository: PlayerRepository = PlayerRepositoryImpl(PlayerDao(DatabaseProvider.getInstance()))
-    //                                          ^ default value que construye la dependencia real acá adentro
-) : ViewModel()
-```
-
-El constructor "acepta" la dependencia, pero el *default value* la sigue creando concretamente dentro de la clase. En un test, si no se pasa el parámetro explícitamente, se sigue instanciando `PlayerRepositoryImpl` real — el acoplamiento no desapareció, solo se escondió un nivel más adentro. DI real implica que **nada** dentro de la clase decide la implementación concreta, ni siquiera como valor por defecto.
-
-## 6. Conexión con arquitectura real
-
-En Timbax, `PlayerRepositoryImpl` implementa la interfaz `PlayerRepository` de `domain`, pero **quién decide** que en producción se use `PlayerRepositoryImpl` (contra SQLDelight) y no un fake es responsabilidad exclusiva del módulo de DI (Koin) — la clase que consume `PlayerRepository` (un `UseCase`, un `ViewModel`) nunca importa `PlayerRepositoryImpl` directamente, solo conoce la interfaz. Esto es lo que después hace posible, en `koin_fundamentos_y_scopes.md`, declarar `single<PlayerRepository> { PlayerRepositoryImpl(get()) }` en un solo lugar del grafo, sin que ninguna otra clase del proyecto sepa que esa implementación existe.
+- **¿Vale la pena, para este proyecto puntual, el overhead de un framework de DI?** No siempre. Para un prototipo chico o descartable, pasar dependencias por constructor a mano (sin Koin ni ningún framework) ya es DI y puede alcanzar. El framework entra cuando el grafo crece lo suficiente como para que armarlo a mano en cada entrypoint se vuelva repetitivo y propenso a error — si la IA metió Koin en un proyecto de 3 clases, preguntate si hacía falta.
