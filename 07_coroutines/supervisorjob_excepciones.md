@@ -28,6 +28,8 @@ Por default, un `Job` normal propaga las excepciones de forma agresiva: si una c
 
 **Cancelación cooperativa** es un mecanismo distinto que usa el mismo canal (excepciones) para una cosa distinta (parar, no fallar). Cuando se llama `scope.cancel()`, Kotlin no "mata" la coroutine a la fuerza — le lanza una `CancellationException` en el próximo punto de suspensión, y espera que esa excepción se propague hacia afuera sin interferencia para que la coroutine termine limpio. El problema (nodo J del diagrama): `CancellationException` es una subclase de `Exception`, así que un `catch (e: Exception)` genérico la atrapa **también** a ella, no solo a los errores de negocio que el catch quería manejar. Si ese catch no relanza la `CancellationException` explícitamente, la cancelación queda "tragada" — la coroutine cree que manejó un error más y sigue ejecutando código que en realidad ya debería haber parado.
 
+**`NonCancellable`** resuelve un caso puntual dentro de esta misma mecánica: código de limpieza que necesita correr *durante* una cancelación en curso — cerrar un archivo, revertir una escritura parcial, notificar que una operación se abortó. Una vez que una coroutine fue cancelada, cualquier punto de suspensión nuevo dentro de ella (otra llamada `suspend`) lanza `CancellationException` de inmediato — así que un `finally { someSuspendFun() }` normal no llega a completar esa limpieza si `someSuspendFun()` es suspendible. `withContext(NonCancellable) { }` abre una ventana que ignora el estado cancelado únicamente para lo que está adentro, dejando que ese código de limpieza puntual sí termine, sin revertir la cancelación del resto de la coroutine.
+
 Cómo se relacionan ambos mecanismos: `SupervisorJob` decide **si** el fallo de una coroutine contamina a otras. La cancelación cooperativa decide **si** una coroutine individual respeta cuando le piden parar. Son ejes distintos, pero ambos dependen de que las excepciones se propaguen correctamente por la jerarquía de coroutines — y por eso un mismo error de código (un `catch` demasiado amplio) puede romper cualquiera de los dos.
 
 ## 3. Cómo se ve en distintos contextos
@@ -96,6 +98,29 @@ class OrdersViewModel(
 
 El patrón `catch (e: CancellationException) { throw e }` antes del `catch (e: Exception)` genérico es lo que garantiza que, si `onCleared()` cancela el scope mientras `loadOrderHistory()` está a mitad de camino, esa cancelación se propague limpio en vez de quedar atrapada por el catch genérico y tratada como si fuera un error de red.
 
+Si además hiciera falta registrar en analytics que la carga se cortó a mitad de camino (una llamada `suspend` propia), ese `finally` necesita la ventana de `NonCancellable`:
+
+```kotlin
+private fun loadOrderHistory() {
+    viewModelScope.launch {
+        try {
+            val orders = getOrderHistoryUseCase()
+            _state.update { it.copy(orders = orders) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _state.update { it.copy(ordersError = e.message) }
+        } finally {
+            withContext(NonCancellable) {
+                analyticsRepository.logLoadAttemptFinished() // suspend fun: sin NonCancellable, no llega a ejecutarse si la coroutine ya fue cancelada
+            }
+        }
+    }
+}
+```
+
+Sin `withContext(NonCancellable) { }`, si la coroutine llega al `finally` ya cancelada, `analyticsRepository.logLoadAttemptFinished()` lanzaría `CancellationException` en el instante en que se suspende — la llamada de analytics ni se completaría, sin ningún error visible que lo delate.
+
 ## 5. Buenas prácticas y errores comunes — checklist de auditoría
 
 Si esta parte del código la entregó una IA, revisar puntualmente:
@@ -105,3 +130,4 @@ Si esta parte del código la entregó una IA, revisar puntualmente:
 - **¿El `try/catch` envuelve un `async { }.await()` asumiendo que alcanza con eso para atrapar el error?** Con un `Job()` normal (no `SupervisorJob`), si otra coroutine hermana falla primero, el scope entero se cancela **antes** de que el flujo llegue al `catch` del `await()` — el catch nunca se ejecuta, aunque esté bien escrito. Esto solo funciona de forma predecible bajo `SupervisorJob`.
 - **¿Usa `CoroutineExceptionHandler` como único mecanismo de manejo de errores?** Sirve como red de seguridad para excepciones realmente no anticipadas, pero no da forma de reflejar un error puntual en el campo correspondiente del `State` — no reemplaza el `try/catch` específico por operación. Además, `CoroutineExceptionHandler` no aplica a `async`: la excepción de un `async` queda guardada en el `Deferred` hasta que se llama `.await()`, ahí recién se relanza.
 - **¿Cada `launch` paralelo tiene su propio manejo de error, o hay un único `try/catch` envolviendo varios `launch` a la vez?** Un solo `try/catch` no puede envolver múltiples `launch` independientes de forma útil — cada `launch` corre su propio bloque, así que el manejo de error tiene que vivir adentro de cada uno si se espera que fallen de forma aislada.
+- **¿Hay una llamada `suspend` de limpieza dentro de un `finally` sin `withContext(NonCancellable) { }`?** Si la coroutine ya está cancelada al llegar al `finally`, cualquier punto de suspensión ahí adentro (sin esa ventana) lanza `CancellationException` de nuevo antes de completarse — la limpieza queda a medias, sin ningún error visible. Solo hace falta `NonCancellable` cuando ese código de limpieza es en sí mismo suspendible — código síncrono en el `finally` no lo necesita.

@@ -12,7 +12,7 @@ flowchart TD
     G["Segundo collect{} independiente"] -.->|"dispara su propia ejecución"| C
 ```
 
-Este diagrama es el mapa macro de `08_flow`: acá se ve el comportamiento base — frío, cada `collect` dispara su propia ejecución del productor. `stateflow.md` hace zoom sobre qué pasa cuando ese comportamiento no alcanza (necesitás que el valor "quede pegado" para nuevos suscriptores). `sharedflow_efectos.md` hace zoom sobre el caso contrario (necesitás que NO quede pegado nada, cada emisión se consume una sola vez).
+Este diagrama es el mapa macro de `08_flow`: acá se ve el comportamiento base — frío, cada `collect` dispara su propia ejecución del productor. `stateflow.md` hace zoom sobre qué pasa cuando ese comportamiento no alcanza (necesitás que el valor "quede pegado" para nuevos suscriptores). `sharedflow_efectos.md` hace zoom sobre el caso contrario (necesitás que NO quede pegado nada, cada emisión se consume una sola vez). `operadores_flow.md` hace zoom sobre lo que pasa entre el productor y el `collect { }`: los operadores intermedios (`map`, `filter`, `debounce`, `combine`, `flatMapLatest`, `flowOn`, `catch`, `retry`, `buffer`/`conflate`) que transforman, combinan, controlan el ritmo o manejan errores de esas emisiones antes de que lleguen al colector.
 
 ## 2. Qué es y cómo funciona
 

@@ -25,7 +25,7 @@ Esto resuelve algo que un `Flow` frío no puede: la UI necesita poder pintar "el
 
 Dos comportamientos internos que valen la pena entender, porque explican bugs no obvios:
 
-- **Conflation**: si el productor emite más rápido de lo que el colector procesa, `StateFlow` no encola cada valor intermedio — el colector se salta directo al último valor disponible cuando vuelve a estar libre. No es un bug, es diseño: `StateFlow` modela "estado actual", no "historial de eventos".
+- **Conflation**: si el productor emite más rápido de lo que el colector procesa, `StateFlow` no encola cada valor intermedio — el colector se salta directo al último valor disponible cuando vuelve a estar libre. No es un bug, es diseño: `StateFlow` modela "estado actual", no "historial de eventos". El operador explícito `.conflate()` sobre un `Flow` frío común replica este mismo mecanismo de forma manual, a diferencia de acá donde es automático — ver `operadores_flow.md` para la diferencia entre ambos casos.
 - **`distinctUntilChanged` implícito**: `StateFlow` no vuelve a emitir si el nuevo valor es `equals()` al anterior. Esto tiene una consecuencia directa sobre `data class`: si el `State` cambia una propiedad pero el resultado sigue siendo `equals()` al anterior (poco común, pero puede pasar con estructuras mal diseñadas), la UI no se entera del cambio.
 
 **`.stateIn()`** es la función que convierte un `Flow` frío en un `StateFlow` compartido (flecha del nodo A al B). Recibe tres parámetros: el `scope` donde vive, un `initialValue` (obligatorio, porque `StateFlow` nunca puede estar "vacío"), y un `SharingStarted` que decide **cuándo arranca y cuándo para** el productor de fondo:

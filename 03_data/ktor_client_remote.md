@@ -18,7 +18,7 @@ flowchart TD
     VM -. State .-> UI
 ```
 
-Cambio importante respecto a los tres archivos anteriores: acá no hay `Flow` emitiendo solo — una llamada de red es pedido/respuesta, no algo que "cambia" espontáneamente. El `Result<T>` sube una sola vez por cada request. Si una pantalla necesita reaccionar en vivo a datos remotos, eso se arma combinando esto con una fuente local (Room/SQLDelight/DataStore) que sí expone `Flow` — no es trabajo de Ktor.
+Cambio importante respecto a los tres archivos anteriores: acá no hay `Flow` emitiendo solo — una llamada de red es pedido/respuesta, no algo que "cambia" espontáneamente. El `Result<T>` sube una sola vez por cada request. Si una pantalla necesita reaccionar en vivo a datos remotos, eso se arma combinando esto con una fuente local (Room/SQLDelight/DataStore) que sí expone `Flow` — no es trabajo de Ktor. (La excepción real es Firestore — ver `firestore_remoto.md` — que sí expone un `Flow` directo desde la nube vía listeners en tiempo real, sin pasar por una fuente local intermedia.)
 
 ## 2. Qué es y cómo funciona
 

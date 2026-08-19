@@ -6,13 +6,13 @@
 flowchart TD
     UC["UseCase"] --> REPO["RepositoryImpl<br/>implementa el contrato de domain"]
     REPO --> LOCAL["Fuente local<br/>Room / SQLDelight / DataStore"]
-    REPO --> REMOTE["Fuente remota<br/>Ktor / Retrofit"]
+    REPO --> REMOTE["Fuente remota<br/>Ktor / Retrofit / Firestore"]
     LOCAL -. Flow (single source of truth) .-> REPO
     REMOTE -. alimenta a local, nunca a la UI directo .-> LOCAL
     REPO -. Flow&lt;Domain&gt; .-> UC
 ```
 
-La flecha punteada de `REMOTE` no va directo a `REPO` — va a `LOCAL`. Ese es el detalle que define todo este archivo: la red nunca le habla a la UI de frente, solo alimenta la base local, y es la base local la única fuente que el `Repository` observa.
+La flecha punteada de `REMOTE` no va directo a `REPO` — va a `LOCAL`. Ese es el detalle que define todo este archivo: la red nunca le habla a la UI de frente, solo alimenta la base local, y es la base local la única fuente que el `Repository` observa. (Excepción real: Firestore, por su caché offline embebida en el SDK, puede actuar como su propia fuente local — ver `firestore_remoto.md` para ese caso puntual.)
 
 ## 2. Qué es y cómo funciona
 
