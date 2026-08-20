@@ -1,8 +1,28 @@
 # sourceset_hierarchy.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Es la organización jerárquica de los `sourceSets` de Gradle en un proyecto KMP: no son solo `commonMain`, `androidMain` e `iosMain` como tres compartimentos aislados, sino un árbol donde podés crear sourceSets **intermedios** que agrupan varios targets emparentados (ej: `appleMain` compartido entre `iosMain`, `macosMain` y `watchosMain`; o `jvmCommonMain` compartido entre `androidMain` y `desktopMain`). Cada sourceSet hereda automáticamente todo lo que está definido en sus padres en la jerarquía.
+```mermaid
+flowchart TB
+    common["commonMain"]
+    apple["appleMain (intermedio, creado a mano)"]
+    ios["iosMain"]
+    macos["macosMain"]
+    android["androidMain"]
+
+    common --> apple
+    common --> android
+    apple --> ios
+    apple --> macos
+
+    style apple fill:#333,stroke:#999
+```
+
+## 2. Qué es y cómo funciona
+
+Es la organización jerárquica de los `sourceSets` de Gradle en un proyecto KMP: no son solo `commonMain`, `androidMain` e `iosMain` como tres compartimentos aislados, sino un árbol donde podés crear sourceSets **intermedios** que agrupan varios targets emparentados (ej: `appleMain` compartido entre `iosMain` y `macosMain`; o `jvmCommonMain` compartido entre `androidMain` y `desktopMain`). Cada sourceSet hereda automáticamente todo lo que está definido en sus padres en la jerarquía.
+
+Como muestra el diagrama, `commonMain` es la raíz que todo hereda. `androidMain` cuelga directo de `commonMain` porque no tiene "hermanos" con los que compartir un intermedio. En cambio `iosMain` y `macosMain` cuelgan de `appleMain` — un sourceSet que no existe por default en KMP, hay que crearlo a mano cuando aparece la primera duplicación real entre esos dos targets.
 
 ```kotlin
 // build.gradle.kts (módulo shared)
@@ -26,46 +46,78 @@ kotlin {
 }
 ```
 
-## 2. El problema que resuelve
+Nota importante: `iosMain` en KMP ya es en sí mismo un sourceSet intermedio automático que agrupa `iosX64Main`/`iosArm64Main`/`iosSimulatorArm64Main` — eso KMP lo da gratis. Lo que **no** da gratis es un padre común entre `iosMain` y `macosMain`; eso hay que crearlo explícitamente como `appleMain`.
 
-Sin sourceSets intermedios, un `actual` que aplica igual a iOS y macOS (por ejemplo, algo implementado con Foundation/UIKit-adjacent APIs que existen en todo el ecosistema Apple) tendría que duplicarse literalmente en `iosMain` y en `macosMain` — mismo código, copiado dos veces, con el riesgo de que diverjan con el tiempo si alguien actualiza uno y se olvida el otro. La jerarquía de sourceSets resuelve esto dejando declarar el `actual` **una sola vez** en el nivel intermedio (`appleMain`) que ambos targets heredan, mientras que las partes que sí difieren entre iOS y macOS específicamente (si las hay) siguen yendo en sus sourceSets hoja respectivos. Es la misma lógica de "no te repitas" aplicada a la estructura de compilación, no solo al código.
+## 3. Cómo se ve en distintos contextos
 
-## 3. Ejemplo mínimo comentado
+En una app de **lectura de ebooks** que corre en Android, iOS y macOS, la lógica para leer el tamaño de fuente preferido del sistema operativo es idéntica entre iOS y macOS (ambos usan APIs de Accessibility de Apple) pero distinta de Android — ese `actual` va una sola vez en `appleMain` y lo heredan ambos targets Apple, en vez de copiarlo dos veces.
+
+En una app de **catálogo de productos** que corre en Android y en una versión Desktop (JVM), compartir el `actual` que lee variables de entorno del sistema operativo (mismo mecanismo Java tanto en Android como en una JVM de escritorio) es un caso típico de sourceSet intermedio `jvmCommonMain` — evita reescribir la misma lógica dos veces solo porque son "targets distintos" en la configuración de Gradle, cuando en los hechos comparten el mismo runtime subyacente.
+
+## 4. Implementación real
+
+**El PO pide:** la app ya corre en Android y iOS, y ahora se suma un target macOS para una versión de escritorio para Mac. Se necesita compartir la lógica de almacenamiento seguro (Keychain) que ya funciona en iOS, porque macOS usa la misma API.
 
 ```kotlin
-// appleMain — un solo actual para toda la familia Apple
+// build.gradle.kts — se agrega macosX64() y se crea appleMain a mano
+kotlin {
+    androidTarget()
+    iosX64()
+    iosArm64()
+    iosSimulatorArm64()
+    macosX64() // nuevo target
+
+    sourceSets {
+        val commonMain by getting
+        val androidMain by getting { dependsOn(commonMain) }
+
+        // appleMain no existe por default — se crea explícitamente
+        val appleMain by creating {
+            dependsOn(commonMain)
+        }
+        val iosX64Main by getting { dependsOn(appleMain) }
+        val iosArm64Main by getting { dependsOn(appleMain) }
+        val iosSimulatorArm64Main by getting { dependsOn(appleMain) }
+        val macosX64Main by getting { dependsOn(appleMain) } // nuevo, cuelga del mismo padre
+    }
+}
+```
+
+```kotlin
+// commonMain — la firma compartida
+expect fun getSecureStorageKey(): String
+```
+
+```kotlin
+// appleMain — un solo actual para toda la familia Apple, antes vivía duplicado en iosMain
 actual fun getSecureStorageKey(): String =
     platform.Security.kSecClassGenericPassword.toString()
 ```
 
 ```kotlin
-// iosMain — solo lo que es específico de iOS, no de toda la familia Apple
+// iosMain — solo lo que sí difiere entre iOS y macOS específicamente
 actual fun getHapticFeedbackStyle(): String = "UIImpactFeedbackGenerator"
-```
 
-```kotlin
-// macosMain — lo específico de macOS, no comparte con iOS
+// macosMain — macOS no tiene haptics de iOS, necesita su propia implementación
 actual fun getHapticFeedbackStyle(): String = "NSHapticFeedbackManager"
 ```
 
-Nota: `getSecureStorageKey()` vive una sola vez en `appleMain` y la heredan tanto `iosMain` como `macosMain` sin declarar nada extra; `getHapticFeedbackStyle()` sí necesita un `actual` distinto en cada uno porque el comportamiento real difiere.
+El punto clave: mover `getSecureStorageKey()` a `appleMain` no rompe nada en iOS — el compilador sigue encontrando el `actual` recorriendo la cadena de herencia (`iosMain` → `appleMain` → `commonMain`), y ahora macOS lo hereda gratis sin duplicar una sola línea.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-**Usar un sourceSet intermedio cuando:**
-- Dos o más targets de la misma familia (Apple, JVM, Native en general) comparten exactamente el mismo `actual`, y ese código usa APIs disponibles en todos esos targets sin excepción.
-- El proyecto ya declara más de 2-3 targets emparentados (si solo tenés `androidTarget()` + `iosX64()`/`iosArm64()`/`iosSimulatorArm64()`, KMP ya te da `iosMain` como sourceSet intermedio automático entre los tres — no hace falta crearlo a mano).
+Si una IA te entrega configuración de sourceSets o código que asume una jerarquía, revisá:
 
-**NO usar un sourceSet intermedio cuando:**
-- Solo tenés un target por familia (ej: un solo target Android, sin variantes) — no hay nada que agrupar, sería una capa vacía.
-- El comportamiento realmente difiere entre los targets "hermanos" — forzar un `actual` común en el sourceSet intermedio cuando en realidad iOS y macOS necesitan lógica distinta te obliga a meter un `if`/`when` de plataforma *dentro* del `actual` compartido, lo cual reintroduce el problema que `expect/actual` existe para evitar (ver `expect_actual.md`).
+- **¿Duplicó código idéntico en `iosMain` y `macosMain` en vez de crear `appleMain`?** — si dos `actual` de targets emparentados son literalmente el mismo código, la IA debería haber propuesto un sourceSet intermedio, no copiarlo dos veces. Duplicación silenciosa es el error más común de este tema.
+- **¿Creó un sourceSet intermedio para targets que en realidad tienen comportamiento distinto?** — el error simétrico: forzar un `actual` común en `appleMain` cuando iOS y macOS necesitan lógica distinta obliga a meter un `if`/`when` de plataforma *dentro* del `actual` compartido, reintroduciendo el problema que `expect/actual` existe para evitar.
+- **¿El `dependsOn()` apunta al padre correcto?** — cada sourceSet nuevo (`appleMain`, `jvmCommonMain`, etc.) necesita `dependsOn(commonMain)` explícito, y cada sourceSet hoja (`iosX64Main`, `macosX64Main`) necesita `dependsOn(appleMain)` — si la IA se olvidó un `dependsOn`, ese sourceSet queda huérfano y no hereda nada de la jerarquía intermedia, aunque el nombre sugiera que sí.
+- **¿Creó un sourceSet intermedio sin necesidad real?** — un `appleMain` declarado con un solo target Apple en el proyecto (sin `macosX64()` ni otro hermano) es una capa vacía, complejidad prematura. Debería agregarse recién cuando aparece la primera duplicación real entre dos targets emparentados.
+- **¿Confundió el sourceSet automático (`iosMain`) con uno manual?** — `iosMain` ya agrupa los tres targets de iOS sin que nadie lo declare a mano; si la IA generó código creando `iosMain by creating { }` explícitamente, es un error — ya existe por default, y recrearlo puede pisar la configuración automática de Kotlin/Native.
 
-**Trade-off real:** los sourceSets intermedios reducen duplicación pero agregan una capa más a la jerarquía que hay que entender al leer el proyecto — en un repo chico con pocos targets, declarar `appleMain` manualmente antes de necesitarlo realmente es complejidad prematura; conviene agregarlo recién cuando aparece la primera duplicación real entre dos targets emparentados, no antes.
+## 6. Profundización: cómo Gradle resuelve la herencia de dependencias entre sourceSets
 
-## 5. Caso trampa
+*(sección extra — para entender qué se hereda exactamente, no solo estructura)*
 
-El proyecto tiene `iosMain` (automático, agrupa `iosX64Main`/`iosArm64Main`/`iosSimulatorArm64Main`) y funciona bien. Se agrega `macosX64()` como nuevo target para una versión de escritorio en Mac. La tentación es poner el `actual` que ya existía en `iosMain` directamente también ahí, duplicado — "totalmente similar, es Apple igual". Pero `iosMain` en KMP es un sourceSet específico de iOS, no de "todo lo Apple" — no existe automáticamente un padre común entre `iosMain` y `macosMain` a menos que lo crees vos mismo (`appleMain`, como en el ejemplo). Si simplemente duplicás el código en `macosMain` en vez de crear el sourceSet intermedio, funciona hoy, pero perdiste la garantía de que ambas copias se mantengan sincronizadas — es exactamente el problema que la jerarquía de sourceSets está pensada para eliminar, y es fácil no darse cuenta porque "compila igual" de las dos formas.
+Cuando un sourceSet declara `dependsOn(otroSourceSet)`, lo que hereda no es solo el código Kotlin — es **todo el classpath de compilación** de ese padre: las dependencias de Gradle (`implementation(...)`) declaradas en el sourceSet padre están disponibles automáticamente en el hijo, sin que haga falta redeclararlas. Esto es lo que hace que declarar una dependencia de Ktor en `commonMain` la haga visible en `androidMain`, `iosMain` y `appleMain` a la vez — todos cuelgan (directa o indirectamente) de `commonMain`.
 
-## 6. Conexión con arquitectura real
-
-Timbax hoy corre en Android e iOS — con la jerarquía automática que KMP da por default (`commonMain` → `androidMain` / `iosMain`, y este último ya agrupando los tres targets de iOS internamente) alcanza sin necesidad de sourceSets intermedios manuales. El día que se sume un target Desktop (JVM) o una segunda plataforma Apple, ahí es cuando conviene revisar si algún `actual` que hoy vive solo en `iosMain` debería subir a un `appleMain` creado a mano, siguiendo el mismo criterio de "duplicación real detectada, no anticipada" que se aplica en general antes de agregar abstracción.
+Esta herencia es transitiva a lo largo de toda la cadena: si `iosX64Main` depende de `appleMain`, que depende de `commonMain`, entonces `iosX64Main` tiene acceso al código y las dependencias de los tres niveles, no solo del inmediatamente superior. Es exactamente el mismo mecanismo por el que, en el ejemplo de implementación real, mover `getSecureStorageKey()` a `appleMain` no requirió cambiar nada en la configuración de `iosX64Main`, `iosArm64Main` ni `iosSimulatorArm64Main` — todos siguen viendo esa función a través de la cadena de herencia, exactamente igual que antes de moverla.

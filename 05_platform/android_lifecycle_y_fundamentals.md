@@ -1,16 +1,42 @@
-# Android Lifecycle y Fundamentals
+# android_lifecycle_y_fundamentals.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-El lifecycle de Android es el conjunto de estados por los que pasa una `Activity` durante su existencia, gestionados por el sistema operativo — no por el desarrollador. Los 6 callbacks core son `onCreate()`, `onStart()`, `onResume()`, `onPause()`, `onStop()` y `onDestroy()` (más `onRestart()`, una transición especial de Stopped → Started que no siempre se invoca). En una app Compose/Compose Multiplatform como Timbax, la `Activity` deja de ser "la pantalla" — pasa a ser un contenedor único (`ComponentActivity`) que monta, una sola vez, el árbol entero de Compose vía `setContent { }`. Es contenido que solo existe en `androidMain`: no hay `expect/actual` que bridgear acá, porque iOS no tiene el concepto de `Activity` (usa `UIViewController`) y Compose Multiplatform ya abstrae esa diferencia por vos.
+```mermaid
+stateDiagram-v2
+    [*] --> Created: onCreate()
+    Created --> Started: onStart()
+    Started --> Resumed: onResume()
+    Resumed --> Started: onPause()
+    Started --> Created: onStop()
+    Created --> Started: onRestart() + onStart()
+    Created --> Destroyed: onDestroy()
+    Destroyed --> [*]
+
+    note right of Resumed
+        Compose visible e interactivo.
+        setContent { } ya montó
+        el árbol entero una sola vez.
+    end note
+```
+
+## 2. Qué es y cómo funciona
+
+El lifecycle de Android es el conjunto de estados por los que pasa una `Activity` durante su existencia, gestionados por el sistema operativo — no por el desarrollador. Los 6 callbacks core son `onCreate()`, `onStart()`, `onResume()`, `onPause()`, `onStop()` y `onDestroy()` (más `onRestart()`, la transición especial de Stopped → Started marcada en el diagrama).
+
+En una app Compose/Compose Multiplatform, la `Activity` deja de ser "la pantalla" — pasa a ser un contenedor único (`ComponentActivity`) que monta, una sola vez, el árbol entero de Compose vía `setContent { }`. Es contenido que solo existe en `androidMain`: no hay `expect/actual` que bridgear acá (ver `expect_actual.md`), porque iOS no tiene el concepto de `Activity` (usa `UIViewController`) y Compose Multiplatform ya abstrae esa diferencia por vos.
 
 Junto con el lifecycle va `Context`: la interfaz que da acceso a recursos del sistema (strings, layouts, servicios). Hay dos sabores relevantes — **Activity Context** (vive y muere con esa Activity puntual, tiene noción de tema/UI) y **Application Context** (vive tanto como el proceso, sin ninguna referencia a una pantalla específica).
 
-## 2. El problema que resuelve
+## 3. Cómo se ve en distintos contextos
 
-Sin un ciclo de vida gestionado por el sistema, cada app tendría que decidir a mano cuándo liberar recursos de UI (cámara, sensores, listeners) y el sistema no podría destruir/recrear Activities de forma segura para liberar memoria cuando el usuario cambia de app, ni recrearlas ante un cambio de configuración (rotación de pantalla) sin perder todo el trabajo en curso. El lifecycle le da a la app un contrato predecible sobre cuándo la UI está visible, interactiva, o directamente destruida — sin eso, cualquier trabajo asincrónico (una corrutina, un listener, una animación) correría el riesgo de intentar tocar una UI que ya no existe, generando crashes o memory leaks.
+En una app de **delivery**, el `MainActivity` es deliberadamente angosto: solo monta `setContent { DeliveryApp() }`, y todo el resto — la lista de pedidos, el detalle, el tracking en mapa — vive como composables dentro de ese único árbol, navegando internamente sin crear Activities nuevas. El `Application Context` es lo que se le pasa a Koin al arrancar, porque los `single {}` (el repositorio de pedidos, el cliente HTTP) necesitan sobrevivir más que cualquier pantalla puntual.
 
-## 3. Ejemplo mínimo comentado
+En una app de **edición de fotos**, un caso legítimo de multi-Activity es cuando se integra un SDK de terceros para compra dentro de la app (in-app purchase) que exige lanzar su propia Activity aislada con su propio ciclo de vida — ahí no tiene sentido forzarlo dentro del árbol de Compose de la app, porque el SDK ya viene con su propia UI nativa y su propio manejo de lifecycle que hay que respetar tal cual.
+
+## 4. Implementación real
+
+**El PO pide:** la pantalla principal de la app tiene que trackear analíticamente cuánto tiempo el usuario la tuvo en foreground, sin usar Activity Context en ningún componente de larga vida (para evitar el memory leak clásico).
 
 ```kotlin
 class MainActivity : ComponentActivity() {
@@ -18,8 +44,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // de acá para abajo, todo lo que corre es Compose compartido de commonMain
         setContent {
-            TimbaxTheme {
-                TimbaxApp() // el único punto Android-only de toda la UI
+            AppTheme {
+                App() // el único punto Android-only de toda la UI
             }
         }
     }
@@ -28,39 +54,56 @@ class MainActivity : ComponentActivity() {
 
 ```kotlin
 // Application Context: vive tanto como el proceso, sin atarse a ninguna Activity puntual
-class TimbaxApplication : Application() {
+class MyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         startKoin {
-            androidContext(this@TimbaxApplication) // Application Context, nunca Activity Context
+            androidContext(this@MyApplication) // Application Context, nunca Activity Context
             modules(appModule)
         }
     }
 }
 ```
 
-`MainActivity` es deliberadamente angosta: su única responsabilidad es el `setContent { }` inicial. `TimbaxApplication` es donde arranca Koin, porque los `single {}` que se declaran ahí (ver `koin_fundamentos_y_scopes.md`) necesitan un `Context` que sobreviva más que cualquier pantalla puntual.
+```kotlin
+// commonMain — el tracking de tiempo en foreground vía Lifecycle-aware API, no callbacks manuales
+@Composable
+fun HomeScreen() {
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-## 4. Matriz de criterio
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> analyticsLogger.logEvent("home_foreground_start", emptyMap())
+                Lifecycle.Event.ON_PAUSE -> analyticsLogger.logEvent("home_foreground_end", emptyMap())
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
-**Application Context vs. Activity Context:**
-- Usar **Application Context** cuando: inicializás algo que vive más que cualquier Activity puntual — `androidContext()` de Koin, el engine de OkHttp para Ktor, el driver de SQLDelight. Todo lo declarado como `single {}` en Koin necesita Application Context, nunca Activity Context.
-- Usar **Activity Context** cuando: necesitás algo atado a la UI/tema visual de esa pantalla puntual — inflar un layout XML legacy, mostrar un `Dialog`, lanzar un `Intent` que abre otra Activity.
-- Trade-off / riesgo: guardar una Activity Context en algo de vida más larga que esa Activity misma es la causa #1 de memory leaks clásicos en Android (ver Caso trampa).
+    // resto de la UI de la pantalla
+}
+```
 
-**Hookear lifecycle callbacks directamente (`onStart`/`onResume`) vs. usar Lifecycle-aware APIs:**
-- Usar **Lifecycle-aware APIs** (`DisposableEffect` + `LocalLifecycleOwner`, `collectAsStateWithLifecycle()`, `viewModelScope`) cuando: el código vive dentro de Compose — es la recomendación oficial actual de Google: no hookear directamente `onStart`/`onResume` desde adentro de un composable.
-- Hookear callbacks de Activity directamente cuando: es setup a nivel de toda la app que no tiene sentido modelar como efecto de Compose — el ejemplo canónico es el `setContent { }` de arriba, o `onNewIntent()` para deep links.
-- Trade-off: los callbacks de Activity dan control total, pero mezclarlos con lógica que debería vivir en un efecto de Compose (`effects_guia_completa.md`) rompe el modelo de "composable como función reactiva a su `State`" y es fuente común de bugs de sincronización.
+`MainActivity` es angosta a propósito, `MyApplication` es donde arranca Koin con Application Context, y el tracking de foreground se resuelve con `DisposableEffect` + `LocalLifecycleOwner` — nunca hookeando `onResume()`/`onPause()` directamente desde adentro de un composable, que es la recomendación oficial actual de Google.
 
-**Single-Activity architecture (lo que usa Compose/Timbax) vs. multi-Activity clásica:**
-- Usar **single-Activity** cuando: el proyecto usa Compose — es el patrón recomendado oficialmente desde la introducción de Jetpack Compose, con la navegación entre "pantallas" resuelta dentro del mismo árbol de composables (`navegacion.md`), no con Activities separadas.
-- Usar **multi-Activity** cuando: mantenimiento de código legacy con XML Views ya estructurado así, o un caso puntual donde una pantalla necesita un ciclo de vida completamente aislado (ej: el flujo de pago de un SDK de terceros que exige su propia Activity).
-- Trade-off: single-Activity simplifica compartir estado entre pantallas (todo vive en el mismo proceso de Compose, sin serializar datos vía Intent extras), pero concentra toda la complejidad de navegación en un solo lugar que hay que diseñar bien desde el principio.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-## 5. Caso trampa
+Si una IA te entrega código relacionado con lifecycle o Context, revisá:
 
-Guardar una Activity Context en un `companion object` (el memory leak más citado de cualquier entrevista de Android):
+- **¿Guardó una Activity Context en algo de vida más larga que esa Activity?** — un `companion object`, un singleton de Koin, cualquier clase con `single {}` que reciba `Context` debería recibir siempre `androidContext()` (Application Context), nunca una referencia directa a `this` desde una Activity. Es la causa #1 de memory leaks clásicos.
+- **¿Hookeó `onStart()`/`onResume()` directamente dentro de un composable?** — si el código vive dentro de Compose, la IA debería haber usado `DisposableEffect` + `LocalLifecycleOwner` o `collectAsStateWithLifecycle()`, no override de callbacks de Activity. Hookear callbacks de Activity solo tiene sentido para setup a nivel de toda la app (el `setContent { }` inicial, `onNewIntent()` para deep links).
+- **¿`MainActivity` quedó "gorda"?** — si la IA metió lógica de negocio, llamadas a repositorios, o manejo de estado directamente en `MainActivity` en vez de dejarla como el punto mínimo que monta `setContent { }`, es señal de que no está respetando el patrón single-Activity con Compose.
+- **¿Propuso múltiples Activities sin una razón real?** — multi-Activity solo se justifica por mantenimiento de código legacy con XML Views, o un caso puntual donde una pantalla necesita un ciclo de vida completamente aislado (un SDK de terceros que lo exige). Si la IA generó una Activity nueva para "una pantalla más" del flujo normal de la app, está rompiendo el patrón single-Activity sin necesidad.
+- **¿El observer de lifecycle se remueve correctamente?** — todo `addObserver()` dentro de un `DisposableEffect` necesita su `removeObserver()` correspondiente en el bloque `onDispose { }`. Si falta, es un leak de listener que persiste después de que el composable sale de composición.
+
+## 6. Profundización: por qué el memory leak del companion object ocurre exactamente en la rotación
+
+*(sección extra — mecánica paso a paso del caso trampa más citado en entrevistas)*
 
 ```kotlin
 // ❌ trampa: el companion object vive tanto como la clase — prácticamente toda la app —
@@ -78,8 +121,12 @@ class AnalyticsTracker private constructor(private val context: Context) {
 AnalyticsTracker.init(this) // "this" acá es la Activity
 ```
 
-El código compila y funciona en el primer uso. El problema aparece en la primera rotación de pantalla o navegación de vuelta: Android destruye la Activity original (`onDestroy`) para recrearla, pero el `companion object` de `AnalyticsTracker` sigue reteniendo una referencia fuerte a esa instancia ya destruida — el recolector de basura no puede liberarla porque un objeto de vida más larga (el singleton) todavía la referencia. Cada rotación deja una Activity "fantasma" completa en memoria, con todas las vistas y recursos que tenía cargados. La regla general: nunca guardar un `Context` de Activity en algo cuya vida excede la de esa Activity puntual — para eso existe `context.applicationContext`.
+La secuencia exacta de lo que pasa en una rotación de pantalla:
 
-## 6. Conexión con Timbax
+1. **Antes de rotar:** `MainActivity` está en estado `Resumed`. `AnalyticsTracker.instance` tiene una referencia fuerte a esa instancia puntual de `MainActivity`.
+2. **El usuario rota el dispositivo:** Android considera esto un cambio de configuración. El sistema dispara `onPause() → onStop() → onDestroy()` sobre la Activity actual — la destruye por completo, con la intención de recrearla desde cero para aplicar la nueva configuración (orientación, tamaño de pantalla).
+3. **Se crea una `MainActivity` nueva:** el sistema instancia una Activity nueva y corre `onCreate()` de nuevo, montando un `setContent { }` nuevo. Si el código llama `AnalyticsTracker.init(this)` otra vez, `instance` ahora apunta a la Activity nueva.
+4. **El problema está en el paso 2, no en el 3:** el recolector de basura de la JVM/ART libera un objeto cuando no hay ninguna referencia fuerte activa hacia él. Pero durante el breve instante entre `onDestroy()` de la vieja y el `init()` de la nueva (y en cualquier escenario donde `init()` no se vuelva a llamar), `AnalyticsTracker.instance` sigue reteniendo la Activity vieja — que ya fue destruida por el sistema operativo pero **no puede ser recolectada** porque el `companion object` (que vive tanto como la clase, prácticamente toda la app) todavía tiene una referencia fuerte hacia ella.
+5. **El resultado acumulativo:** cada rotación repite el ciclo. Si `init()` se llama de nuevo cada vez, la Activity vieja eventualmente sí queda sin referencias y se libera — pero hay una ventana real donde coexisten en memoria la Activity "fantasma" (con todas sus vistas y recursos ya inflados) y la nueva, y en escenarios donde el `Context` viejo se sigue usando después de la destrucción (un callback asíncrono que capturó `context` antes de la rotación y responde después), la referencia nunca se limpia y el leak es permanente.
 
-Timbax tiene exactamente una `MainActivity` del lado Android — es el único archivo verdaderamente "Android puro" del flujo de UI, y su única responsabilidad es el `setContent { }` que monta el árbol de Compose de `commonMain`. El resto del ciclo de vida se maneja indirectamente por abstracciones que el repo ya documenta: el `ViewModel` (`viewmodel.md`) sobrevive a la destrucción/recreación de esa Activity por su propio scope, `collectAsStateWithLifecycle()` (`collect_stateflow_en_compose.md`) pausa la colección del `StateFlow` cuando la Activity no está en foreground, y todos los `single {}` de Koin se inyectan a partir del `Application Context` de `TimbaxApplication` — nunca de un `Context` de Activity, precisamente para evitar el leak del Caso trampa. En otras palabras: buena parte de lo ya documentado en el repo (ViewModel, StateFlow con lifecycle, DisposableEffect) son abstracciones que existen justamente para que el día a día en Compose casi nunca requiera tocar estos callbacks de Activity a mano — pero un entrevistador SSR va a esperar que sepas qué hay debajo de esas abstracciones.
+La solución (`context.applicationContext` en vez de la Activity directamente) rompe el problema en la raíz: el `Application Context` es la misma instancia durante toda la vida del proceso, así que no hay "Activity vieja" que retener — el objeto referenciado nunca se destruye mientras el proceso viva, entonces no hay nada que leakear.

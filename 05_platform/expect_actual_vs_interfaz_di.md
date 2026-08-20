@@ -1,68 +1,98 @@
 # expect_actual_vs_interfaz_di.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Es la decisión de criterio entre dos mecanismos que resuelven el mismo problema de fondo — "necesito código distinto por plataforma" — pero con garantías y costos distintos: `expect/actual` (resolución en compile-time, sin indirección) vs. una interfaz común en `domain`/`data` con una implementación concreta por plataforma, inyectada vía Koin (resolución en runtime, a través del grafo de DI).
-
-```kotlin
-// Opción A: expect/actual
-expect fun getDeviceId(): String
-
-// Opción B: interfaz + DI
-interface DeviceIdProvider {
-    fun getDeviceId(): String
-}
-// androidMain: single<DeviceIdProvider> { AndroidDeviceIdProvider(androidContext()) }
-// iosMain: single<DeviceIdProvider> { IosDeviceIdProvider() }
+```mermaid
+flowchart TD
+    A["Necesito código distinto por plataforma"] --> B{"¿La implementación<br/>necesita dependencias<br/>por constructor?"}
+    B -->|"No — función pura,<br/>sin estado"| C{"¿Necesito testear con<br/>fake/mock esta capacidad?"}
+    B -->|"Sí — Context, cliente HTTP,<br/>otra clase del grafo"| D["Interfaz + DI (Koin)"]
+    C -->|"No"| E["expect/actual"]
+    C -->|"Sí"| D
+    E --> F["Resuelto en compile-time<br/>sin indirección"]
+    D --> G["Resuelto en runtime<br/>vía grafo de Koin"]
 ```
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Sin este criterio explícito, es fácil caer en dos errores simétricos: usar `expect/actual` para todo lo que difiere por plataforma (incluyendo cosas con dependencias o que necesitan fakes en tests, donde se vuelve incómodo) o usar interfaz+DI para todo (incluyendo casos triviales de una sola función pura, donde agregar una interfaz y un binding de Koin es ceremonia de más para nada). Ninguno de los dos mecanismos es "el correcto" en abstracto — la pregunta que resuelve este archivo es *cuál conviene según la forma del problema concreto*, y esa pregunta no está resuelta en ningún lado de la fuente original ni es intuitiva la primera vez que se topa con el tema.
+Es la decisión de criterio entre dos mecanismos que resuelven el mismo problema de fondo — "necesito código distinto por plataforma" — pero con garantías y costos distintos: `expect/actual` (resolución en compile-time, sin indirección, ver `expect_actual.md`) vs. una interfaz común en `domain`/`data` con una implementación concreta por plataforma, inyectada vía Koin (resolución en runtime, a través del grafo de DI).
 
-## 3. Ejemplo mínimo comentado
+Como muestra el diagrama, la pregunta que separa un camino del otro no es "¿esto difiere por plataforma?" — eso es cierto en ambos casos — sino **si la implementación necesita recibir algo por constructor** y **si vas a necesitar reemplazarla por un fake en tests**. Ninguno de los dos mecanismos es "el correcto" en abstracto: la forma del problema concreto determina cuál conviene.
+
+## 3. Cómo se ve en distintos contextos
+
+En una app de **fitness**, saber si el dispositivo soporta un sensor de pasos nativo es candidato ideal para `expect/actual`: es una consulta puntual, sin estado, sin dependencias — el mismo tipo de función atómica que un `getPlatformName()`. Pero el logger que manda esos eventos a un servicio de analítica externo (que necesita una API key, un cliente HTTP configurado, y que en tests se quiere reemplazar por un fake que no dispare llamadas reales) es candidato para interfaz + DI, porque tiene dependencias de construcción y necesita ser testeable.
+
+En una app de **streaming de música**, el control del volumen del sistema es un caso simple de `expect/actual` — una función que lee/escribe un valor nativo sin más contexto. En cambio, el reproductor de audio en sí (que necesita configuración, mantiene estado interno de reproducción, y sobre el que vas a querer testear la lógica de "qué pasa cuando termina una canción" sin depender del motor de audio real) va por interfaz + DI, con una implementación fake para tests de la lógica que lo consume.
+
+## 4. Implementación real
+
+**El PO pide:** loguear eventos de analítica (qué pantalla se vio, qué botón se tocó) para un dashboard interno, y que ese logging se pueda desactivar completamente en tests sin tocar la lógica que lo dispara.
 
 ```kotlin
-// Caso simple: candidato ideal para expect/actual — sin dependencias, sin estado
-expect fun getPlatformName(): String
-```
-
-```kotlin
-// Caso con dependencias: mal candidato para expect/actual, bien para interfaz + DI
+// commonMain — interfaz, no expect/actual, porque hay dependencias y se necesita fake en tests
 interface AnalyticsLogger {
     fun logEvent(name: String, params: Map<String, String>)
 }
-
-// androidMain — necesita el Context de Android
-class AndroidAnalyticsLogger(private val context: Context) : AnalyticsLogger {
-    override fun logEvent(name: String, params: Map<String, String>) { /* ... */ }
-}
-
-// Koin, androidMain
-single<AnalyticsLogger> { AndroidAnalyticsLogger(androidContext()) }
 ```
 
-Con `expect/actual`, pasarle el `Context` a un `actual class AndroidAnalyticsLogger` implica declarar el `expect class` con constructor, y ya empieza a sentirse forzado comparado con dejar que Koin resuelva la dependencia naturalmente.
+```kotlin
+// androidMain — necesita el Context de Android para inicializar el SDK nativo
+class AndroidAnalyticsLogger(private val context: Context) : AnalyticsLogger {
+    override fun logEvent(name: String, params: Map<String, String>) {
+        // ejemplo: FirebaseAnalytics.getInstance(context).logEvent(name, params.toBundle())
+    }
+}
+```
 
-## 4. Matriz de criterio
+```kotlin
+// iosMain — necesita su propio setup nativo, sin Context (no existe en iOS)
+class IosAnalyticsLogger : AnalyticsLogger {
+    override fun logEvent(name: String, params: Map<String, String>) {
+        // ejemplo: llamada al SDK nativo de analítica vía cinterop
+    }
+}
+```
 
-**Usar `expect/actual` cuando:**
-- Es una función (no una clase con estado) sin dependencias externas.
-- El comportamiento es realmente fijo por plataforma, sin necesidad de swappear implementaciones en tests o en distintos flavors.
-- Querés la garantía dura de compile-time: si te olvidás el `actual`, no compila — con DI, un `single` mal registrado recién explota en runtime al resolver el grafo.
+```kotlin
+// androidMain — módulo de Koin
+val androidPlatformModule = module {
+    single<AnalyticsLogger> { AndroidAnalyticsLogger(androidContext()) }
+}
 
-**Usar interfaz + DI cuando:**
-- La implementación necesita recibir dependencias (Context, un cliente ya configurado, otra clase del grafo).
-- Necesitás testear la lógica que *consume* esa capacidad con un fake (`FakeAnalyticsLogger`) sin tocar plataforma real — esto es imposible de forma limpia con `expect/actual`, porque no hay contrato inyectable, solo una función global.
-- Podrías necesitar más de una implementación en la misma plataforma (ej: un logger real y uno no-op según build variant) — Koin permite resolver eso con distintos módulos o calificadores; `expect/actual` no tiene ese grado de libertad, es una implementación fija por target.
-- Ya tenés un ViewModel o UseCase que depende de la capacidad — mantener el patrón de inyección de dependencias consistente (todo entra por constructor) es más legible que mezclar "esto se inyecta" con "esto se llama como función global de `expect/actual`".
+// iosMain — módulo de Koin
+val iosPlatformModule = module {
+    single<AnalyticsLogger> { IosAnalyticsLogger() }
+}
+```
 
-**Trade-off real:** `expect/actual` gana en simplicidad y en la garantía de compile-time; interfaz+DI gana en testabilidad y flexibilidad de composición. La regla mental rápida: *si necesitás pasarle algo al constructor de la implementación, ya no es candidato para `expect/actual`*.
+```kotlin
+// commonTest — el fake reemplaza la implementación real sin tocar la lógica que la consume
+class FakeAnalyticsLogger : AnalyticsLogger {
+    val loggedEvents = mutableListOf<String>()
+    override fun logEvent(name: String, params: Map<String, String>) {
+        loggedEvents.add(name)
+    }
+}
+```
 
-## 5. Caso trampa
+Con `expect/actual`, pasarle el `Context` a un `actual class AndroidAnalyticsLogger` implicaría declarar el `expect class` con constructor, y ya empieza a sentirse forzado comparado con dejar que Koin resuelva la dependencia naturalmente — y el `FakeAnalyticsLogger` de test directamente no tendría dónde engancharse.
 
-Tenés `expect fun getDeviceId(): String` funcionando bien. Un sprint después, Marketing pide que el ID de dispositivo se loguee junto con la versión del SO y se cachee para no recalcularlo en cada llamada. La reacción rápida es agregar un `expect class DeviceInfoProvider` con estado interno (`private var cachedId: String? = null`) y mantener `expect/actual`, porque "ya estaba así, solo lo extiendo". El problema: ahora esa clase tiene estado y potencialmente vas a querer testear el comportamiento de cacheo (¿se recalcula si cambia el SO? ¿se limpia en algún momento?) sin depender de la implementación real de Android/iOS — y `expect/actual` no te da un punto de inyección para un fake en ese test. La señal de que cruzaste la línea "función pura → estado con reglas" es exactamente la señal de que tendría que migrar a interfaz + DI, aunque signifique un refactor de lo que ya estaba andando.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-## 6. Conexión con arquitectura real
+Si una IA te entrega código resolviendo una diferencia de plataforma, revisá:
 
-En Timbax, el caso de uso típico de interfaz+DI en vez de `expect/actual` sería un `FirebaseAuthProvider` o cualquier wrapper sobre el SDK de GitLive Firebase que necesita configuración (API keys, instancia de la app de Firebase) — ahí ya hay dependencias de por medio, así que va como interfaz en `domain` (o `data`, según si otras capas necesitan conocerla) con implementación inyectada por Koin, siguiendo el mismo patrón que `PlayerRepository`/`PlayerRepositoryImpl`. `expect/actual` puro queda reservado a lo verdaderamente atómico, como `getPlatformName()` del archivo anterior.
+- **¿Eligió `expect/actual` para algo con dependencias por constructor?** — si el `actual` necesita un `Context`, un cliente HTTP, o cualquier objeto del grafo de DI, la IA eligió mal el mecanismo. Señal clara: si ves un `expect class` (no `expect fun`) con parámetros de constructor, es candidato fuerte a migrar a interfaz + DI.
+- **¿Eligió interfaz + DI para algo trivial de una sola función pura?** — el error simétrico: una interfaz con un solo método, una sola implementación por plataforma, sin estado, sin necesidad real de fake en tests, es ceremonia de más. `expect/actual` directo es más simple ahí.
+- **¿La interfaz vive en la capa correcta?** — si la capacidad la consume `domain` (un UseCase), la interfaz debería vivir en `domain` y la implementación en `data` o `platform`, nunca al revés (domain no puede depender de implementaciones concretas de plataforma).
+- **¿El binding de Koin está en el módulo de plataforma correcto?** — cada `single<Interfaz> { ImplementacionAndroid(...) }` tiene que estar en el módulo de `androidMain`, no en `commonMain` (donde no compilaría, porque la clase concreta no existe ahí).
+- **¿Hay un fake/mock disponible para tests si la lógica que consume la interfaz tiene tests?** — si la IA generó la interfaz pero no un fake mínimo en `commonTest`, y hay tests que dependen de esa capacidad, falta esa pieza.
+- **¿Se coló un `expect/actual` dentro de algo que después necesitó estado?** — si el código empezó como `expect fun` simple y la IA lo fue "parchando" agregándole estado interno (variables `var` a nivel de `actual`), es señal de que cruzó la línea y debería haber migrado a interfaz + DI en vez de acumular estado en una función expect.
+
+## 6. Profundización: costo real de cada mecanismo en runtime vs. compile-time
+
+*(sección extra — para entender qué se está pagando en cada camino, no solo cuándo elegirlo)*
+
+Con `expect/actual`, el costo de resolución es **cero en runtime**: como se vio en `expect_actual.md`, el compilador conecta la llamada `expect` con su `actual` correspondiente durante la compilación de cada target, así que en el binario final no queda ningún rastro de indirección — es una llamada directa a función, tan barata como cualquier otra. El costo real está en tiempo de compilación (obliga a tener el `actual` completo en cada target) y en diseño (no admite parámetros de construcción variables).
+
+Con interfaz + DI, el costo se traslada a runtime: Koin arma su grafo de dependencias al arrancar la app (`startKoin { modules(...) }`), y cada `single<Interfaz> { Implementacion(...) }` se resuelve la primera vez que algo pide esa interfaz — recién ahí Koin busca en su registro interno qué implementación concreta corresponde a esa plataforma. Esto significa que un binding mal declarado (una interfaz sin implementación registrada en algún módulo) **no falla al compilar** — compila perfecto, porque el compilador no valida el grafo de Koin — y solo explota en runtime, con un `NoDefinitionFoundException`, la primera vez que algo intenta resolver esa dependencia. Es exactamente la diferencia de garantías que menciona la matriz de criterio: `expect/actual` falla temprano (compile-time), interfaz + DI falla tarde (runtime, y solo si el código que dispara la resolución efectivamente se ejecuta — un módulo mal configurado puede pasar inadvertido si esa rama de código no se testea).
