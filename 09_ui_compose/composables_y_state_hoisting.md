@@ -1,90 +1,121 @@
 # composables_y_state_hoisting.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Un `@Composable` es una función que describe una porción de UI a partir de datos de entrada, y que Compose puede volver a ejecutar (recomponer) cuando esos datos cambian. **State hoisting** es el patrón de "elevar" el estado desde el composable hijo hacia su padre: el hijo deja de guardar su propio estado interno y en su lugar recibe el valor actual (`value`) y una función para pedir que cambie (`onValueChange`), convirtiéndose en **stateless**.
+```mermaid
+flowchart TD
+    A["Composable STATEFUL<br/>(remember interno)"] -->|"❌ nadie afuera<br/>puede leerlo"| B["Estado atrapado,<br/>no reusable, no testeable"]
+    C["Composable STATELESS<br/>(value + onValueChange)"] -->|"recibe"| D["value: T<br/>(desde afuera)"]
+    C -->|"emite"| E["onValueChange: (T) -> Unit<br/>(hacia afuera)"]
+    D -.->|"hoisted por"| F["Padre / Screen<br/>(en última instancia, ViewModel)"]
+    E -.->|"llega a"| F
+    F -->|"única fuente<br/>de verdad"| G["State inmutable"]
+```
+
+## 2. Qué es y cómo funciona
+
+Un `@Composable` es una función que describe una porción de UI a partir de datos de entrada, y que Compose puede volver a ejecutar (recomponer) cuando esos datos cambian. **State hoisting** es el patrón de "elevar" el estado desde el composable hijo hacia su padre: el hijo deja de guardar su propio estado interno y en su lugar recibe el valor actual (`value`) y una función para pedir que cambie (`onValueChange`), convirtiéndose en **stateless** — como muestra el diagrama, es la diferencia entre un composable que guarda su propio dato (caja cerrada, nadie más accede) y uno que solo recibe y emite (caja transparente, la fuente de verdad vive afuera).
 
 Un composable stateless es, idealmente, una función pura: mismo input (mismo `State`), mismo resultado visual — sin memoria propia, sin efectos colaterales ocultos.
-
-## 2. El problema que resuelve
 
 Si cada composable guardara su propio estado interno (por ejemplo, un `Switch` que mantiene su `checked` con un `remember` propio), ese estado queda encerrado ahí — nadie fuera del composable puede leerlo, validarlo, ni decidir qué hacer con él. En una pantalla real, casi siempre alguien más necesita saber ese valor: el `ViewModel` para persistirlo, otro composable hermano para reaccionar a él, o una regla de negocio que depende de él.
 
 State hoisting resuelve esto separando dos responsabilidades que suelen mezclarse: "cómo se ve/comporta la UI" (el composable) de "cuál es la fuente de verdad del dato" (quien lo hoistea, en última instancia el `ViewModel`). El composable se vuelve reusable (sirve para cualquier fuente de estado, no solo para un `remember` interno), testeable (podés testear su salida visual dado un `value` fijo, sin necesitar disparar estado interno oculto) y predecible.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+En una **app de notas**, el campo de texto donde el usuario escribe el título de una nota nunca guarda ese texto por su cuenta: recibe `title: String` y expone `onTitleChange: (String) -> Unit`, y es el `ViewModel` de la pantalla de edición quien decide qué hacer con cada tecla — validar longitud, disparar autoguardado, o simplemente actualizar el `State`. Si el campo guardara el texto internamente con un `remember`, no habría forma de que el autoguardado del `ViewModel` se entere de lo que el usuario está escribiendo en tiempo real.
+
+En una **app de reservas de restaurantes**, un selector de cantidad de comensales (un `Stepper` con botones +/-) sigue exactamente el mismo patrón: recibe `guestCount: Int` y `onGuestCountChange: (Int) -> Unit`. Esto permite que la misma UI de selector se reuse tanto en la pantalla de nueva reserva como en la de edición de una reserva existente — el composable no sabe ni le importa si el número viene de un valor por defecto o de una reserva ya guardada en base de datos; solo dibuja lo que le llega y avisa cuando el usuario lo cambia.
+
+## 4. Implementación real
+
+**El PO pide:** en la pantalla de historial de pedidos de una app de delivery, el usuario debe poder tocar un pedido para expandirlo y ver el detalle de sus `OrderItem`, sin que ese estado de "expandido" se pierda cuando la lista se reordena por fecha.
 
 ```kotlin
-// SIN hoisting: el composable "posee" su estado, nadie afuera puede leerlo ni controlarlo
-@Composable
-fun PlayerNameFieldStateful() {
-    var name by remember { mutableStateOf("") }
-    TextField(value = name, onValueChange = { name = it })
-}
+// Modelo de dominio (ver 02_domain/model.md)
+data class Order(
+    val id: String,
+    val items: List<OrderItem>,
+    val total: Double
+)
 
-// CON hoisting: el estado vive afuera, el composable es una función pura de sus params
-@Composable
-fun PlayerNameField(
-    name: String,
-    onNameChange: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    TextField(
-        value = name,
-        onValueChange = onNameChange,
-        modifier = modifier
-    )
-}
-
-// Quien hoistea el estado: en este caso, directamente el StateFlow del ViewModel
-@Composable
-fun AddPlayerScreen(viewModel: AddPlayerViewModel) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-
-    PlayerNameField(
-        name = state.name,
-        onNameChange = { viewModel.onEvent(AddPlayerEvent.OnNameChanged(it)) }
-    )
-}
+data class OrderItem(
+    val name: String,
+    val quantity: Int
+)
 ```
 
-`PlayerNameField` no sabe ni le importa de dónde viene `name` — podría ser un `remember` local en un preview, o el `State` real del `ViewModel` en producción. Esa independencia es exactamente lo que lo hace reusable.
-
-## 4. Matriz de criterio
-
-**Composable stateful (con `remember` propio) vs stateless (hoisted)**
-- Usar stateful cuando: el estado es puramente de UI, efímero, y a nadie más le importa (ej: si un tooltip está expandido, la posición de scroll visual momentánea).
-- Usar stateless (hoisted) cuando: el dato importa fuera del composable — se persiste, se valida, se comparte entre composables, o forma parte de una regla de negocio.
-- Trade-off: hoistear todo "por las dudas" agrega verbosidad innecesaria a estado que genuinamente es solo de UI; no hoistear nada convierte al composable en una caja negra imposible de testear o reusar con otra fuente de datos.
-
-**Patrón `value` + `onValueChange`**
-- Usar cuando: es la convención estándar de Compose para cualquier composable con estado hoisted — mantenerla hace que el composable se sienta "nativo" y predecible para cualquiera que lea el código.
-- NO inventar nombres de parámetros alternativos (`text`/`updateText`, `data`/`change`) sin razón — romper la convención obliga a quien lee el código a redescubrir el patrón en cada composable distinto.
-
-**Nivel al que se hoistea el estado**
-- Usar el nivel más bajo posible cuando: el estado no necesita salir de un composable padre inmediato (ej: si dos hijos hermanos comparten un estado, hoistealo al padre común, no directamente al `ViewModel`).
-- Usar el `ViewModel` (vía `State`) cuando: el dato tiene relevancia de negocio, debe sobrevivir recomposición/rotación, o afecta a más de una sección de la pantalla.
-- Trade-off: hoistear "demasiado alto, siempre al ViewModel" infla el `State` con cosas que son puramente de presentación visual local; hoistear "muy bajo, nunca al ViewModel" termina duplicando lógica en composables que deberían compartir una única fuente de verdad.
-
-## 5. Caso trampa
-
 ```kotlin
+// SIN hoisting: el composable "posee" el estado de expansión,
+// nadie afuera puede saber ni controlar qué pedido está expandido
 @Composable
-fun ScoreCounter(initialScore: Int) {
-    var score by remember { mutableStateOf(initialScore) }
+fun OrderRowStateful(order: Order) {
+    var isExpanded by remember { mutableStateOf(false) }
 
-    Row {
-        Text("$score")
-        Button(onClick = { score++ }) { Text("+1") }
+    Column(modifier = Modifier.clickable { isExpanded = !isExpanded }) {
+        Text("Pedido #${order.id} — $${order.total}")
+        if (isExpanded) {
+            order.items.forEach { item ->
+                Text("${item.quantity}x ${item.name}")
+            }
+        }
     }
 }
-
-// Uso en la pantalla:
-ScoreCounter(initialScore = state.currentScore)
 ```
 
-La trampa: parece funcionar — el contador incrementa visualmente al tocar el botón. Pero `score` es un `remember` *local* al composable, inicializado una sola vez con `initialScore`. Si el `ViewModel` actualiza `state.currentScore` por otra vía (por ejemplo, otro jugador sincronizado vía Firebase, o una corrección de puntaje desde otra pantalla), `ScoreCounter` **no se entera** — sigue mostrando su copia local, desincronizada del verdadero estado. El bug es silencioso: compila, corre, y visualmente "funciona" en el caso feliz de un solo usuario tocando el botón una sola vez, pero rompe la garantía de fuente única de verdad en cuanto hay más de un camino que puede cambiar el score. La solución es hoistear: `ScoreCounter(score: Int, onIncrement: () -> Unit)`, dejando que el `ViewModel` sea la única fuente de verdad, tal como exige MVI.
+```kotlin
+// CON hoisting: el composable es una función pura de sus parámetros
+@Composable
+fun OrderRow(
+    order: Order,
+    isExpanded: Boolean,
+    onToggleExpand: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier.clickable { onToggleExpand(order.id) }) {
+        Text("Pedido #${order.id} — $${order.total}")
+        if (isExpanded) {
+            order.items.forEach { item ->
+                Text("${item.quantity}x ${item.name}")
+            }
+        }
+    }
+}
+```
 
-## 6. Conexión con arquitectura real
+```kotlin
+// Quien hoistea el estado: el ViewModel, vía un Set<String> de ids expandidos en el State
+data class OrdersState(
+    val orders: List<Order> = emptyList(),
+    val expandedOrderIds: Set<String> = emptySet()
+)
 
-State hoisting es, en Timbax, la bisagra entre `presentation` y `ui` documentada implícitamente desde `06_presentation_mvi/contract_state_event_effect.md`: el `PlayersState` que expone el `ViewModel` como `StateFlow` es el estado "hoisted al máximo" — la fuente de verdad única de toda la pantalla. Cada composable de UI (`PlayerCard`, `AddPlayerForm` de `material3_componentes_comunes.md`) es stateless y recibe fragmentos de ese `State` más callbacks que terminan emitiendo un `Event` hacia el `ViewModel`. La cadena completa —`ViewModel` (dueño del estado) → `Screen` (lee `State`, hoistea hacia los hijos) → composables hijos (stateless, solo `value`/`onValueChange`)— es la aplicación literal de Clean Architecture dentro de la capa de UI: cada nivel conoce solo lo que necesita, y la fuente de verdad nunca se duplica.
+@Composable
+fun OrdersScreen(viewModel: OrdersViewModel) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+
+    LazyColumn {
+        items(state.orders, key = { it.id }) { order ->
+            OrderRow(
+                order = order,
+                isExpanded = order.id in state.expandedOrderIds,
+                onToggleExpand = { id -> viewModel.onEvent(OrdersEvent.OnOrderToggled(id)) }
+            )
+        }
+    }
+}
+```
+
+La diferencia importa concretamente acá: si la lista de pedidos se reordena (llega un pedido nuevo, o el usuario cambia el criterio de orden), la versión `Stateful` pierde o desincroniza su expansión porque `remember` está atado a la instancia del composable en su posición, no al pedido. La versión hoisted no tiene ese problema — `expandedOrderIds` vive en el `State` del `ViewModel`, indexado por `order.id`, sobreviviendo cualquier reordenamiento de la lista.
+
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
+
+Si una IA generó o modificó un composable, revisar:
+
+- **¿El composable guarda con `remember` un valor que en realidad importa fuera de él?** Si otro composable, un `ViewModel`, o una regla de negocio necesitaría ese valor, es una señal de que debería estar hoisted, no atrapado en un `remember` local.
+- **¿El nombre de los parámetros sigue la convención `value` + `onValueChange`?** Nombres inventados (`text`/`updateText`, `data`/`onDataChanged`) no son incorrectos técnicamente, pero rompen la previsibilidad esperada en cualquier composable hoisted del proyecto.
+- **¿El composable expone un parámetro `modifier: Modifier = Modifier` con default?** Si es un composable reusable y no lo tiene, es una omisión — impide que quien lo usa controle su posición/tamaño desde afuera.
+- **¿Hay un `remember` inicializado a partir de un valor que viene de `State` (`remember { mutableStateOf(state.algo) }`)?** Esto es casi siempre un bug: crea una segunda fuente de verdad que se desincroniza del `State` real apenas este cambia por otra vía — el error más común que puede introducir una IA "para simplificar" un composable.
+- **¿El nivel al que se hoistea el estado es razonable?** Un estado genuinamente efímero y local (si un tooltip está abierto, la posición visual de un drag momentáneo) no necesita subir hasta el `ViewModel` — pero un dato con relevancia de negocio (como `expandedOrderIds` del ejemplo, si además necesitara persistirse) sí. Sobre-hoistear infla el `State` con cosas puramente visuales; sub-hoistear duplica lógica que debería compartirse.
+- **¿El composable sigue siendo, en los hechos, una función pura?** Si además de recibir `value`/`onValueChange` dispara efectos colaterales directamente en su cuerpo (llamadas de red, logs, side effects sin pasar por `LaunchedEffect`/`SideEffect`), ya no es realmente stateless en el sentido que importa — ver `effects_guia_completa.md`.

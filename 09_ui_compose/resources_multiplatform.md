@@ -1,73 +1,86 @@
 # resources_multiplatform.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-`composeResources` es el sistema oficial de recursos compartidos de Compose Multiplatform: strings, imágenes (`.xml`/`.png`/`.svg`/`.webp`), fuentes (`.ttf`/`.otf`) y archivos raw, definidos una sola vez en `commonMain` bajo una carpeta `composeResources/`, con el compilador generando accesos type-safe (`Res.string.app_name`, `Res.drawable.icon_player`, `Res.font.roboto_bold`) utilizables desde cualquier plataforma del proyecto.
+```mermaid
+flowchart TD
+    A["commonMain/composeResources/"] -->|"values/strings.xml"| B["Res.string.x<br/>(type-safe, generado)"]
+    A -->|"drawable/icon.xml"| C["Res.drawable.x"]
+    A -->|"font/roboto.ttf"| D["Res.font.x"]
+    B --> E["stringResource(Res.string.x)"]
+    C --> F["painterResource(Res.drawable.x)"]
+    E --> G["Mismo código de UI<br/>en Android / iOS / Desktop"]
+    F --> G
+```
+
+## 2. Qué es y cómo funciona
+
+`composeResources` es el sistema oficial de recursos compartidos de Compose Multiplatform: strings, imágenes (`.xml`/`.png`/`.svg`/`.webp`), fuentes (`.ttf`/`.otf`) y archivos raw, definidos una sola vez en `commonMain` bajo una carpeta `composeResources/`, con el compilador generando accesos type-safe (`Res.string.app_name`, `Res.drawable.icon_player`, `Res.font.roboto_bold`) utilizables desde cualquier plataforma del proyecto — como muestra el diagrama, el mismo recurso declarado una vez llega, vía `stringResource()`/`painterResource()`, al mismo código de UI sin importar en qué plataforma corra.
 
 Reemplaza el modelo clásico de Android, donde `res/` vive únicamente dentro del módulo Android y cada plataforma (iOS, Desktop) necesitaría su propio mecanismo de recursos completamente separado.
-
-## 2. El problema que resuelve
 
 En un proyecto KMP sin `composeResources`, cada plataforma maneja sus recursos de forma nativa y aislada: Android usa `res/values/strings.xml`, iOS usaría `Localizable.strings` o assets del bundle, Desktop necesitaría su propio mecanismo de carga de archivos. Esto significa mantener el mismo string o el mismo ícono duplicado en 2-3 lugares distintos, con el riesgo real de que se desincronicen (un texto se corrige en Android pero no en iOS) y sin ningún chequeo de compilación que detecte un recurso faltante.
 
 `composeResources` resuelve esto centralizando todo en `commonMain`, con generación de código type-safe: si un string no existe, es un error de compilación (`Res.string.nombre_inexistente` no compila), no un crash en runtime como pasaría con un `getString(R.string.nombre_inexistente)` mal tipeado en el modelo clásico de Android.
 
-## 3. Ejemplo mínimo comentado
+Usar `composeResources` es la opción correcta por default para la gran mayoría de strings e imágenes de una app KMP — la excepción son recursos inherentemente nativos de una plataforma (un ícono de notificación de Android con formato específico exigido por el sistema, metadata de `Info.plist` en iOS), que no pasan por Compose Multiplatform en absoluto. Cualquier texto visible al usuario final debería vivir en `composeResources`, salvo texto verdaderamente interno de desarrollo (logs, nombres de debug) — centralizar todos los strings en un solo lugar facilita auditar el copy completo de la app y deja la puerta abierta a soporte multi-idioma sin refactors futuros.
 
-```kotlin
-// Estructura de carpetas, dentro de commonMain:
-// composeResources/
-//   values/strings.xml       -> <string name="players_title">Jugadores</string>
-//   drawable/icon_player.xml
-//   font/roboto_bold.ttf
+## 3. Cómo se ve en distintos contextos
 
-@Composable
-fun PlayersScreen() {
-    Column {
-        Text(
-            text = stringResource(Res.string.players_title), // type-safe, generado por el compilador
-            fontFamily = FontFamily(Font(Res.font.roboto_bold))
-        )
-        Image(
-            painter = painterResource(Res.drawable.icon_player),
-            contentDescription = stringResource(Res.string.player_icon_description)
-        )
-    }
-}
+En una **app de recetas**, los nombres de las categorías ("Postres", "Entradas", "Platos principales") viven en `composeResources/values/strings.xml` con sus traducciones correspondientes por idioma — si la app se lanza en un mercado nuevo, agregar el idioma es declarar un nuevo `values-xx/strings.xml` sin tocar ningún composable.
+
+En una **app de clima**, los íconos de condiciones climáticas (sol, lluvia, nublado) se declaran una sola vez en `drawable/` dentro de `commonMain` y se acceden vía `Res.drawable.icon_sunny` desde el mismo composable en las tres plataformas — sin necesidad de mantener tres sets de íconos sincronizados manualmente.
+
+## 4. Implementación real
+
+**El PO pide:** un diálogo de confirmación al cancelar un pedido, con el nombre del pedido interpolado en el mensaje, que debe poder traducirse a otros idiomas más adelante.
+
+```xml
+<!-- commonMain/composeResources/values/strings.xml -->
+<resources>
+    <string name="cancel_order_title">Cancelar pedido</string>
+    <string name="cancel_order_confirmation">¿Confirmás cancelar el pedido #%1$s?</string>
+</resources>
 ```
 
-`stringResource()` y `painterResource()` son composables que leen el recurso correspondiente a la plataforma actual (por ejemplo, aplicando la localización activa del dispositivo para strings) de forma transparente — el código de UI es idéntico sin importar en qué plataforma corra.
-
-## 4. Matriz de criterio
-
-**`composeResources` vs recursos nativos por plataforma (`res/` de Android, assets de iOS)**
-- Usar `composeResources` cuando: el recurso es genuinamente compartido entre plataformas — la gran mayoría de strings e imágenes de una app KMP entran en este caso.
-- Usar recursos nativos por plataforma cuando: el recurso es específico de una plataforma por razones técnicas (por ejemplo, un ícono de notificación de Android que debe cumplir el formato específico que exige el sistema, o metadata de `Info.plist` en iOS) — esos no pasan por Compose Multiplatform en absoluto, son configuración nativa de esa plataforma puntual.
-- Trade-off: centralizar todo en `commonMain` es la opción correcta por default, pero no elimina la necesidad de conocer cuándo un recurso es inherentemente nativo y no debería forzarse a compartirse.
-
-**Strings hardcodeados en el composable vs `stringResource()`**
-- Usar `stringResource(Res.string.x)` cuando: siempre, salvo texto verdaderamente interno de desarrollo (logs, nombres de debug) — cualquier texto visible al usuario final debería vivir en `composeResources`, nunca como un `String` literal dentro del composable.
-- NO hardcodear cuando: el texto necesitará traducirse a otro idioma en el futuro, o simplemente por consistencia — centralizar todos los strings en un solo lugar facilita auditar el copy completo de la app sin recorrer cada archivo `.kt`.
-- Trade-off: agrega un paso extra (declarar el string en el `.xml` antes de poder usarlo) comparado con tipear el texto directo — fricción mínima a cambio de mantenibilidad real.
-
-**Nombres de recursos**
-- Usar cuando: nombres descriptivos y consistentes (`players_title`, `icon_player`, no `text1`, `img_final_v2`) — el nombre generado (`Res.string.players_title`) es lo que aparece en el autocompletado del IDE, así que un mal nombre ahí se sufre en cada uso futuro.
-
-## 5. Caso trampa
-
 ```kotlin
+// Caso trampa (lo que NO hay que hacer): string hardcodeado con interpolación directa
 @Composable
-fun SaveConfirmationDialog(playerName: String) {
+fun CancelOrderDialogBad(orderId: String) {
     AlertDialog(
         onDismissRequest = {},
-        text = { Text("¿Confirmás guardar a $playerName?") }, // string hardcodeado con interpolación
+        text = { Text("¿Confirmás cancelar el pedido #$orderId?") }, // hardcodeado
         confirmButton = { /* ... */ }
     )
 }
 ```
 
-La trampa: parece inofensivo — es solo un mensaje de confirmación, y usar `composeResources` para algo tan puntual puede sentirse como sobre-ingeniería. Pero en cuanto la app necesita soportar más de un idioma (o incluso simplemente cambiar el copy desde un lugar centralizado sin buscar en archivos `.kt` dispersos), este string queda fuera del sistema — nadie lo va a encontrar buscando en `composeResources/values/strings.xml`, y quedará hardcodeado permanentemente a menos que alguien lo detecte manualmente durante una revisión. La forma correcta es declarar un string con placeholder: `<string name="save_confirmation">¿Confirmás guardar a %1$s?</string>` y usarlo como `stringResource(Res.string.save_confirmation, playerName)` — Compose Multiplatform soporta placeholders posicionales igual que el sistema de recursos clásico de Android.
+```kotlin
+// Corrección: recurso type-safe con placeholder posicional
+@Composable
+fun CancelOrderDialog(orderId: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(Res.string.cancel_order_title)) },
+        text = { Text(stringResource(Res.string.cancel_order_confirmation, orderId)) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Sí, cancelar") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Volver") }
+        }
+    )
+}
+```
 
-## 6. Conexión con arquitectura real
+`stringResource(Res.string.cancel_order_confirmation, orderId)` reemplaza el placeholder `%1$s` del string declarado en el `.xml` con el valor de `orderId` en tiempo de ejecución — Compose Multiplatform soporta placeholders posicionales igual que el sistema de recursos clásico de Android. A diferencia de la versión `Bad`, este texto sí aparece en `composeResources/values/strings.xml`, así que es descubrible para cualquiera que audite el copy completo de la app, y queda listo para traducirse con solo agregar un `values-en/strings.xml` sin tocar el composable.
 
-En Timbax, todo el copy visible (títulos de pantalla, labels de botones, mensajes de confirmación) y los assets visuales (íconos de jugador, logos) viven en `composeResources` dentro de `commonMain` — coherente con el objetivo general de KMP de maximizar código compartido documentado en `todosobreKMP`. Es también la razón por la cual componentes como `AddPlayerForm` (`material3_componentes_comunes.md`) nunca deberían tener un string tipeado directo en el `Text()`: el label "Nombre del jugador" de ese ejemplo, en una implementación real de Timbax, sería `stringResource(Res.string.add_player_name_label)`, manteniendo consistencia con el resto del copy de la app y dejando la puerta abierta a soporte multi-idioma sin refactors futuros.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
+
+Si una IA generó o modificó código con texto o imágenes visibles al usuario, revisar:
+
+- **¿Hay un `Text("texto literal")` con contenido visible al usuario, en vez de `stringResource(Res.string.x)`?** Es el error más común, y el más fácil de pasar por alto en una revisión rápida — el código compila y funciona igual, pero ese string queda invisible para cualquier auditoría de copy o esfuerzo de traducción futuro.
+- **¿Un string con interpolación directa (`"Hola $nombre"`) en vez de un placeholder posicional del recurso (`Res.string.saludo` con `%1$s`)?** Mismo problema que el anterior, agravado porque además hay que revisar manualmente el código Kotlin para entender qué texto se muestra realmente, en vez de leerlo directo del `.xml`.
+- **¿Se usó `composeResources` para un recurso que en realidad es inherentemente nativo de una plataforma** (metadata de `Info.plist`, un ícono de notificación con formato específico del sistema)? Forzar ese tipo de recurso a `commonMain` no funciona técnicamente — esos casos puntuales deben quedar en la configuración nativa correspondiente.
+- **¿Los nombres de los recursos son descriptivos** (`cancel_order_confirmation`) **o genéricos** (`text1`, `msg_2`, `img_final_v2`)? Un nombre pobre se sufre en cada uso futuro, porque es literalmente lo que aparece en el autocompletado del IDE al usar el recurso.
+- **¿Falta algún recurso referenciado** (`Res.string.nombre_inexistente`)? A diferencia del modelo clásico de Android, esto debería fallar en compilación, no en runtime — si el código compila, es una señal de que el recurso efectivamente existe declarado en `commonMain`.

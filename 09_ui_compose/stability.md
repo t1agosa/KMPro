@@ -1,80 +1,92 @@
 # stability.md
 
-## 1. Qué es
+## 1. Mapa del flujo
+
+```mermaid
+flowchart TD
+    A["Compiler plugin de Compose<br/>(tiempo de COMPILACIÓN)"] --> B{"¿Tipo estable?"}
+    B -->|"data class,<br/>solo val, tipos estables"| C["ESTABLE<br/>Compose confía en equals()"]
+    B -->|"List&lt;T&gt; / interfaz<br/>o var mutable"| D["INESTABLE<br/>Compose no puede confiar"]
+    C --> E["Recomposition skipping<br/>funciona correctamente"]
+    D --> F["Recompone SIEMPRE,<br/>aunque el contenido<br/>no haya cambiado"]
+```
+
+## 2. Qué es y cómo funciona
 
 **Stability** es el criterio que usa el compilador de Compose para decidir si puede confiar en un tipo lo suficiente como para **skipear** la recomposición de un composable que lo recibe como parámetro. Un tipo es "estable" si Compose puede garantizar que, mientras sus propiedades públicas no cambien, dos instancias del mismo tipo producen el mismo resultado visual — y que Compose se va a enterar si efectivamente cambiaron (vía `equals()`).
 
-Este análisis lo hace el **compiler plugin de Compose** en tiempo de compilación, no en runtime: cada tipo queda marcado internamente como estable o inestable antes de que la app corra.
-
-## 2. El problema que resuelve
+Este análisis lo hace el **compiler plugin de Compose** en tiempo de compilación, no en runtime: como muestra el diagrama, cada tipo queda marcado internamente como estable o inestable *antes* de que la app corra — no es una decisión que Compose tome dinámicamente mientras la UI está en pantalla.
 
 Recomposition skipping (documentado en `recomposicion.md`) depende de que Compose pueda comparar "¿los parámetros de este composable cambiaron respecto a la última vez?". Si un tipo es mutable de forma que Compose no puede verificar con seguridad (por ejemplo, una interfaz como `List<T>`, que en teoría podría ser una `MutableList` mutada por fuera sin que nadie se entere), Compose no puede confiar en que no cambió — y para estar seguro, **recompone igual**, incluso si en la práctica nada cambió.
 
 Sin el concepto de stability, cada composable con un parámetro de tipo "dudoso" perdería automáticamente el beneficio de skipping, sin que el desarrollador tenga ninguna señal de por qué su pantalla recompone más de lo esperado.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+En una **app de recetas**, el `State` de la pantalla de detalle expone `ingredients: List<Ingredient>`. Aunque el usuario no toque nada relacionado a los ingredientes, cualquier otro cambio del `State` (por ejemplo, `isFavorite` al tocar el corazón) fuerza a Compose a recomponer también el composable que renderiza la lista de ingredientes — porque `List<T>` es inestable, Compose no puede confiar en que "sigue siendo la misma lista" solo por comparación.
+
+En una **app de biblioteca personal**, un `State` con `books: List<Book>` sufre exactamente el mismo problema al marcar un libro como leído: aunque el catálogo de libros no cambió en absoluto, el composable que lo muestra recompone de todas formas — el costo es invisible para el usuario en catálogos chicos, pero se vuelve perceptible (jank real) en catálogos largos con covers de libros pesados de renderizar.
+
+## 4. Implementación real
+
+**El PO pide:** en la pantalla de historial de pedidos, agregar un pull-to-refresh — sin que cada refresco recomponga innecesariamente la lista completa de pedidos cuando su contenido no cambió.
 
 ```kotlin
-// ESTABLE: data class con solo propiedades val de tipos estables
-data class Player(
-    val id: String,
-    val name: String,
-    val score: Int
-)
-// Compose puede confiar: si el equals() dice que no cambió, no cambió.
-
-// INESTABLE: expone una List<T> (interfaz), no una implementación concreta inmutable
-data class PlayersState(
-    val players: List<Player>, // <- inestable a ojos del compilador
-    val isLoading: Boolean
+// INESTABLE: List<T> es una interfaz, Compose no puede confiar en ella
+data class OrdersState(
+    val orders: List<Order> = emptyList(), // <- inestable a ojos del compilador
+    val isRefreshing: Boolean = false
 )
 
 @Composable
-fun PlayersList(players: List<Player>) {
-    // Este composable NO puede skipear recomposición basándose solo en "players",
-    // porque List<T> es una interfaz — podría ser una MutableList mutada por fuera
+fun OrdersList(orders: List<Order>) {
+    // NO puede skipear basándose solo en "orders", porque List<T>
+    // podría ser una MutableList mutada por fuera sin nueva composición
     LazyColumn {
-        items(players, key = { it.id }) { player -> PlayerCard(player) }
+        items(orders, key = { it.id }) { order -> OrderCard(order) }
     }
 }
 ```
 
-`Player` es estable porque todas sus propiedades (`String`, `Int`) son tipos estables y son `val`. `List<Player>`, en cambio, es la interfaz de Kotlin, no una implementación específica — Compose no puede garantizar en compile-time que la instancia real detrás de esa interfaz no vaya a mutar sin pasar por una nueva composición.
-
-## 4. Matriz de criterio
-
-**`List<T>` vs `ImmutableList<T>` (de `kotlinx.collections.immutable`)**
-- Usar `ImmutableList<T>` cuando: el `State` que expone el `ViewModel` incluye colecciones, y te importa que Compose pueda skipear recomposición correctamente en listas grandes o pantallas con composables costosos.
-- Seguir usando `List<T>` cuando: es un proyecto chico, sin síntomas de performance, donde agregar la dependencia extra no se justifica todavía.
-- Trade-off: `ImmutableList` requiere agregar la librería `kotlinx.collections.immutable` y convertir explícitamente (`.toImmutableList()`) en el punto donde se construye el `State` — más fricción a cambio de una garantía real de skipping.
-
-**`data class` con `val` vs `var`**
-- Usar `val` siempre cuando: el `State` de MVI ya exige inmutabilidad por diseño (ver `06_presentation_mvi`) — esto además de ser correcto para MVI, es lo que hace que la `data class` sea estable.
-- NO usar `var` en propiedades de un `State` — además de romper el patrón MVI de estado inmutable, un `var` hace que el compilador marque el tipo como inestable, porque ese campo podría mutar sin pasar por un nuevo `copy()`.
-
-**Cuándo preocuparse por stability**
-- Investigar cuando: hay evidencia real de recomposición excesiva (mismo criterio que en `recomposicion.md` — el Layout Inspector muestra conteos altos en composables que no deberían recomponer).
-- NO reescribir todo el `State` a tipos inmutables "por las dudas" sin evidencia — es optimización, no corrección; el código sigue siendo funcionalmente correcto con `List<T>` normal, solo pierde una optimización de performance.
-
-## 5. Caso trampa
-
 ```kotlin
-data class PlayersState(
-    val players: List<Player> = emptyList(),
-    val isLoading: Boolean = false
+// ESTABLE: ImmutableList<T> le da a Compose la garantía que necesita
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.toImmutableList
+
+data class OrdersState(
+    val orders: ImmutableList<Order> = persistentListOf(),
+    val isRefreshing: Boolean = false
 )
 
 @Composable
-fun PlayersScreen(viewModel: PlayersViewModel) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-
-    // Solo cambia isLoading, players es "la misma lista" en términos de contenido
-    PlayersList(players = state.players)
+fun OrdersList(orders: ImmutableList<Order>) {
+    // Ahora SÍ puede skipear: si "orders" es la misma instancia
+    // inmutable, Compose confía en que el contenido no cambió
+    LazyColumn {
+        items(orders, key = { it.id }) { order -> OrderCard(order) }
+    }
 }
 ```
 
-La trampa: intuitivamente, si `state.players` tiene el mismo contenido que antes (mismos jugadores, mismo orden), uno esperaría que `PlayersList` no recomponga cuando solo cambia `isLoading`. Pero como `List<Player>` es inestable a ojos del compilador, Compose **no puede confiar** en que la lista es "la misma" solo comparando referencias o incluso `equals()` con la garantía necesaria para skipear — así que recompone `PlayersList` en cada emisión del `StateFlow`, incluso cuando el cambio real fue en un campo completamente distinto del `State`. Esto pasa *incluso si Compose está haciendo bien su trabajo con el resto*: es específicamente la inestabilidad de `List<T>` la que rompe el skipping en este composable puntual, no un error de código. La corrección real es usar `ImmutableList<Player>` en el `State`, no reestructurar el resto de la arquitectura.
+```kotlin
+// En el ViewModel, al construir el nuevo State tras el refresh:
+_state.update { current ->
+    current.copy(
+        isRefreshing = true
+        // orders NO se reasigna acá: sigue siendo la misma instancia
+        // inmutable hasta que llegue la respuesta real del repositorio
+    )
+}
+```
 
-## 6. Conexión con arquitectura real
+Sin el cambio a `ImmutableList`, cada vez que el usuario hace pull-to-refresh y solo cambia `isRefreshing` (los pedidos todavía no llegaron de vuelta), Compose recompone igual todo `OrdersList` completo — aunque el contenido de `orders` sea exactamente el mismo. Con `ImmutableList<Order>`, Compose puede confiar en que si la instancia no cambió, el contenido tampoco, y `OrdersList` se skipea correctamente mientras solo cambia el indicador de refresco (ver `recomposicion.md`).
 
-En Timbax, cada vez que `PlayersState` expone una colección (`players: List<Player>`, o un futuro `matchHistory: List<Round>`), la decisión de si usar `List<T>` simple o `ImmutableList<T>` es exactamente el tipo de decisión que documenta la Matriz de criterio de este archivo: no es "siempre usar Immutable" ni "nunca preocuparse", sino evaluarlo cuando la pantalla en cuestión (por ejemplo, un historial largo de partidas con `LazyColumn`, ver `listas_lazy.md`) muestra señales reales de recomposición innecesaria. Es la contracara práctica de `recomposicion.md`: ese archivo explica *qué* es el skipping, este explica *qué condiciones del tipo* lo habilitan o lo bloquean silenciosamente.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
+
+Si una IA generó o modificó un `State` o un composable que lo consume, revisar:
+
+- **¿El `State` expone `List<T>`, `Map<K,V>` o `Set<T>` planos en lugar de sus versiones de `kotlinx.collections.immutable`?** Es inestable por definición del compiler plugin de Compose, independientemente de que en la práctica nunca se mute. La corrección es `ImmutableList<T>` / `persistentListOf()`, no reestructurar el resto del `State`.
+- **¿Alguna propiedad del `State` es `var` en vez de `val`?** Además de romper el patrón de estado inmutable de MVI (ver `06_presentation/mvi.md`), un `var` marca automáticamente ese tipo como inestable — el compilador no puede confiar en que no mutó por fuera de un `copy()`.
+- **¿Se está reescribiendo todo el `State` a tipos inmutables "por las dudas", sin evidencia de un problema real?** Es optimización, no corrección — el código sigue siendo funcionalmente correcto con `List<T>` normal, solo pierde una optimización de performance. La señal correcta para actuar es evidencia real vía Layout Inspector (mismo criterio que en `recomposicion.md`), no una sospecha genérica.
+- **¿Se agregó la dependencia `kotlinx.collections.immutable` y la conversión explícita (`.toImmutableList()` / `persistentListOf()`) en el punto donde se construye el `State`,** o solo se cambió el tipo del parámetro del composable sin tocar el origen del dato? Cambiar solo la firma del composable sin ajustar cómo el `ViewModel` construye esa colección no soluciona nada — la inestabilidad sigue estando en el origen.
+- **¿El proyecto es chico y sin síntomas de performance, y aun así se está introduciendo esta complejidad extra?** Seguir usando `List<T>` simple es válido cuando la fricción de agregar la librería y las conversiones no se justifica todavía — no es un estándar a aplicar ciegamente en todo `State` nuevo.

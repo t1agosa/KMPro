@@ -1,78 +1,104 @@
-
 # collect_stateflow_en_compose.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-`collectAsStateWithLifecycle()` es la función que conecta un `StateFlow` del `ViewModel` con Compose, convirtiéndolo en un `State<T>` que un composable puede leer y ante cuyos cambios puede recomponer. Es la puerta de entrada estándar por la cual el `State` de MVI (documentado en `06_presentation_mvi` y `08_flow/stateflow.md`) llega finalmente a la UI.
+```mermaid
+flowchart TD
+    A["StateFlow&lt;OrdersState&gt;<br/>(ViewModel)"] --> B["collectAsStateWithLifecycle()<br/>UNA VEZ, en OrdersScreen"]
+    B --> C["State&lt;OrdersState&gt;<br/>(delegated property, by)"]
+    C --> D["Se desestructura"]
+    D --> E["OrdersHeader(title)"]
+    D --> F["OrdersList(orders)"]
+    D --> G["RefreshingIndicator(isRefreshing)"]
+    H["App pasa a background"] -.->|"pausa automática"| B
+    I["App vuelve a foreground"] -.->|"reanuda"| B
+```
+
+## 2. Qué es y cómo funciona
+
+`collectAsStateWithLifecycle()` es la función que conecta un `StateFlow` del `ViewModel` con Compose, convirtiéndolo en un `State<T>` que un composable puede leer y ante cuyos cambios puede recomponer. Es la puerta de entrada estándar por la cual el `State` de MVI (documentado en `06_presentation/mvi.md` y `08_flow/stateflow.md`) llega finalmente a la UI — como muestra el diagrama, la colección ocurre una única vez en el composable raíz de la pantalla, y de ahí el `State` se desestructura hacia los hijos.
 
 Existe también `collectAsState()` (sin el sufijo `WithLifecycle`), una versión más simple pero con una diferencia de comportamiento importante que determina cuál corresponde usar.
 
-## 2. El problema que resuelve
-
 Un `StateFlow` es un stream de coroutines — no tiene, por sí mismo, ninguna noción de "la UI está visible" o "la app está en background". Si un composable colecta un `StateFlow` sin ningún control de ciclo de vida, sigue colectando (y potencialmente recomponiendo, o manteniendo trabajo activo aguas arriba) incluso cuando la app pasó a background y no hay nada visible en pantalla — desperdiciando batería y CPU, y en casos más severos, generando crashes por intentar actualizar UI que ya no está en un estado seguro para recibir cambios.
 
-`collectAsStateWithLifecycle()` resuelve esto atando la colección al ciclo de vida real de la plataforma: pausa automáticamente cuando el composable no está en foreground, y la reanuda cuando vuelve — sin que el desarrollador tenga que gestionar esto manualmente.
+`collectAsStateWithLifecycle()` resuelve esto atando la colección al ciclo de vida real de la plataforma: pausa automáticamente cuando el composable no está en foreground, y la reanuda cuando vuelve — sin que el desarrollador tenga que gestionar esto manualmente. Es la opción recomendada oficialmente para colectar flows atados a UI en producción; `collectAsState()` se reserva para contextos donde el concepto de "ciclo de vida de plataforma" no aplica de la misma forma (algunos targets no-Android de Compose Multiplatform, tests/previews simplificados).
 
-## 3. Ejemplo mínimo comentado
+La colección debería ocurrir **una sola vez**, en el composable más alto de la pantalla, y de ahí desestructurarse y pasarse como parámetros puntuales hacia los hijos — coincide con el criterio ya documentado en `recomposicion.md` sobre granularidad de `State`, y mantiene a los composables hijos stateless (`composables_y_state_hoisting.md`), sin necesitar una referencia directa al `ViewModel`.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de clima**, la pantalla principal colecta el `StateFlow` del `ViewModel` una sola vez en el composable raíz — si la app pasa a background mientras el usuario cambia de app, esa colección se pausa automáticamente, evitando que se sigan procesando actualizaciones de pronóstico que nadie está viendo.
+
+En una **app de mensajería**, la pantalla de lista de chats sigue el mismo patrón: `collectAsStateWithLifecycle()` una vez en `ChatsScreen`, y de ahí cada `ChatRow` recibe solo `lastMessage: String` y `unreadCount: Int` como parámetros — nunca una referencia al `ViewModel` para colectar por su cuenta.
+
+## 4. Implementación real
+
+**El PO pide:** en la pantalla de historial de pedidos, cada `OrderRow` debe mostrar si ese pedido está marcado como favorito, sin que cada fila de la lista termine colectando su propio `StateFlow`.
 
 ```kotlin
+// Caso trampa (lo que NO hay que hacer): cada fila colecta su propia copia
 @Composable
-fun PlayersScreen(viewModel: PlayersViewModel) {
-    // recomendado: pausa la colección cuando la app no está en foreground
-    val state by viewModel.state.collectAsStateWithLifecycle()
+fun OrderRowBad(order: Order, viewModel: FavoritesViewModel = koinInject()) {
+    // Si hay 50 pedidos en la lista, esto son 50 colecciones
+    // independientes del mismo StateFlow de FavoritesViewModel
+    val favState by viewModel.state.collectAsStateWithLifecycle()
+    val isFavorite = favState.favoriteOrderIds.contains(order.id)
 
-    Column {
-        if (state.isLoading) {
-            CircularProgressIndicator()
-        } else {
-            PlayersList(players = state.players)
+    Row {
+        Text("Pedido #${order.id}")
+        IconButton(onClick = { viewModel.onEvent(FavoritesEvent.OnToggle(order.id)) }) {
+            Icon(if (isFavorite) Icons.Filled.Star else Icons.Outlined.Star, null)
         }
     }
 }
 ```
 
-`by` aplica **delegated properties** (documentado en `Keywords_guide`, sección `by`): `state` se comporta como una variable normal (`state.isLoading`, `state.players`) aunque en realidad esté delegando su lectura a un `State<PlayersState>` por detrás. Cada vez que el `StateFlow` del `ViewModel` emite un nuevo `PlayersState`, Compose recompone automáticamente las partes de `PlayersScreen` que leen `state`.
-
-## 4. Matriz de criterio
-
-**`collectAsStateWithLifecycle()` vs `collectAsState()`**
-- Usar `collectAsStateWithLifecycle()` cuando: siempre, en Android/producción — es la opción recomendada oficialmente para colectar flows atados a UI, porque respeta el ciclo de vida de la plataforma (pausa en background).
-- Usar `collectAsState()` cuando: en contextos donde no aplica el concepto de "ciclo de vida de plataforma" de la misma forma (algunos targets no-Android de Compose Multiplatform, o en tests/previews simplificados) — pero en el código de producción de una app KMP con target Android, no hay buena razón para preferirlo sobre la versión con lifecycle.
-- Trade-off: `collectAsStateWithLifecycle()` requiere la dependencia de `androidx.lifecycle` correspondiente para KMP — un costo de setup mínimo comparado con el beneficio de no desperdiciar recursos en background.
-
-**Dónde llamar la colección (nivel de `Screen` vs nivel de composable hijo)**
-- Usar cuando: la colección se hace **una sola vez**, en el composable más alto de la pantalla (`PlayersScreen`), y de ahí se desestructura y pasa como parámetros puntuales hacia los hijos — coincide con el criterio ya documentado en `recomposicion.md` sobre granularidad de `State`.
-- NO usar cuando: cada composable hijo colecta el `StateFlow` del `ViewModel` de forma independiente — eso multiplica colecciones redundantes del mismo stream, y además rompe el patrón de composables stateless (`composables_y_state_hoisting.md`), porque cada hijo terminaría necesitando una referencia directa al `ViewModel` en vez de recibir datos por parámetro.
-
-**`state.value` (acceso directo) vs `by` (delegated property)**
-- Usar `by` cuando: siempre — es la forma idiomática, permite tratar `state` como si fuera el valor mismo (`state.players`) en vez de tener que escribir `state.value.players` en cada lectura.
-- Evitar el acceso manual `.value` repetido — no es incorrecto, pero es más verboso sin ningún beneficio a cambio.
-
-## 5. Caso trampa
-
 ```kotlin
+// Corrección: una única colección arriba, desestructurada hacia abajo
 @Composable
-fun PlayerCard(player: Player) {
-    Row {
-        Text(player.name)
-        FavoriteButton(playerId = player.id)
+fun OrdersScreen(
+    ordersViewModel: OrdersViewModel,
+    favoritesViewModel: FavoritesViewModel
+) {
+    val ordersState by ordersViewModel.state.collectAsStateWithLifecycle()
+    val favoritesState by favoritesViewModel.state.collectAsStateWithLifecycle()
+
+    LazyColumn {
+        items(ordersState.orders, key = { it.id }) { order ->
+            OrderRow(
+                order = order,
+                isFavorite = order.id in favoritesState.favoriteOrderIds,
+                onToggleFavorite = { favoritesViewModel.onEvent(FavoritesEvent.OnToggle(order.id)) }
+            )
+        }
     }
 }
 
 @Composable
-fun FavoriteButton(playerId: String, viewModel: FavoritesViewModel = koinInject()) {
-    // cada card de la lista colecta su PROPIA copia del StateFlow completo
-    val state by viewModel.state.collectAsStateWithLifecycle()
-    val isFavorite = state.favoriteIds.contains(playerId)
-
-    IconButton(onClick = { viewModel.onEvent(FavoritesEvent.OnToggle(playerId)) }) {
-        Icon(if (isFavorite) Icons.Filled.Star else Icons.Outlined.Star, null)
+fun OrderRow(
+    order: Order,
+    isFavorite: Boolean,
+    onToggleFavorite: () -> Unit
+) {
+    // Completamente stateless: no conoce ningún ViewModel
+    Row {
+        Text("Pedido #${order.id}")
+        IconButton(onClick = onToggleFavorite) {
+            Icon(if (isFavorite) Icons.Filled.Star else Icons.Outlined.Star, null)
+        }
     }
 }
 ```
 
-La trampa: si `FavoriteButton` se usa dentro de una `LazyColumn` con 50 jugadores, esto significa **50 colecciones independientes** del mismo `StateFlow` de `FavoritesViewModel` — cada una recomponiendo su propio `IconButton` de forma redundante cada vez que `state.favoriteIds` cambia, aunque solo un jugador haya cambiado de favorito. Funciona, no hay error, pero es ineficiente y además rompe la idea de "colectar una vez arriba, desestructurar hacia abajo": la fuente de verdad del favorito de cada jugador debería resolverse en el `PlayersScreen` (colectando `FavoritesViewModel` una sola vez ahí) y pasarse como un simple `Boolean isFavorite` a `FavoriteButton`, dejando a este último completamente stateless, sin necesitar conocer al `ViewModel` en absoluto.
+Con la versión corregida, si la lista tiene 50 pedidos, hay exactamente **dos** colecciones activas en toda la pantalla (`ordersState` y `favoritesState`), sin importar cuántos `OrderRow` se rendericen. En la versión `Bad`, serían 50 colecciones redundantes del mismo `StateFlow` de favoritos — cada una recomponiendo su propio `IconButton` de forma independiente cada vez que cambia cualquier favorito, aunque solo uno haya cambiado.
 
-## 6. Conexión con arquitectura real
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-En Timbax, `collectAsStateWithLifecycle()` se llama **una única vez** por pantalla, siempre en el composable raíz que recibe el `ViewModel` inyectado vía Koin (ver `04_di/koin_fundamentos_y_scopes.md`, scope `viewModel`) — nunca en composables hijos intermedios. Esa disciplina es lo que mantiene consistente toda la cadena documentada en `composables_y_state_hoisting.md`: `ViewModel` (única fuente de verdad) → `Screen` (única colección) → composables hijos (stateless, reciben solo lo que necesitan). Romper esa regla, aunque técnicamente "funcione", reintroduce fuentes de estado dispersas — exactamente el problema que MVI existe para prevenir.
+Si una IA generó o modificó código que colecta un `StateFlow` en Compose, revisar:
+
+- **¿Se usa `collectAsState()` en vez de `collectAsStateWithLifecycle()` en código de producción Android/KMP?** Salvo un contexto explícito donde no aplica ciclo de vida de plataforma (test, preview, target sin Android), siempre corresponde la versión con lifecycle.
+- **¿Hay más de una colección del mismo `StateFlow` dentro de la misma pantalla** (un composable hijo con `viewModel: XViewModel = koinInject()` colectando por su cuenta, en vez de recibir el dato por parámetro)? Es el caso trampa más común dentro de listas (`LazyColumn`) — cada ítem terminando con su propia colección redundante en vez de recibir el valor ya resuelto desde arriba.
+- **¿Se usa `state.value.campo` en vez de `by` + `state.campo`?** No es un error funcional, pero rompe la convención idiomática del repo — revisar que se use `val state by viewModel.state.collectAsStateWithLifecycle()`.
+- **¿El composable hijo recibe una referencia directa a un `ViewModel`** (como parámetro o inyectado con `koinInject()`) cuando debería ser stateless y recibir solo los datos puntuales que necesita? Rompe el patrón documentado en `composables_y_state_hoisting.md` — un composable hijo con acceso directo a un `ViewModel` deja de ser reusable y testeable de forma aislada.
+- **¿La colección está en el composable más alto de la pantalla (`XScreen`), o dispersa en composables intermedios?** Cuanto más abajo en el árbol ocurre la colección, más difícil es garantizar que no haya colecciones duplicadas o desincronizadas del mismo stream.

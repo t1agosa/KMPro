@@ -1,86 +1,87 @@
 # remember_vs_remembersaveable.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-`remember` y `rememberSaveable` son APIs para guardar un valor en memoria dentro de un composable, sobreviviendo a recomposiciones sucesivas. La diferencia entre ambos está en **qué eventos del ciclo de vida sobreviven**:
+```mermaid
+flowchart TD
+    A["Valor en un composable"] --> B{"¿Cómo se declara?"}
+    B -->|"var x = ..."| C["Se reinicializa<br/>en CADA recomposición"]
+    B -->|"remember { }"| D["Sobrevive recomposiciones"]
+    B -->|"rememberSaveable { }"| E["Sobrevive recomposiciones<br/>+ cambio de configuración"]
+    D -->|"navegás afuera / rotás"| F["❌ Se pierde"]
+    E -->|"rotás pantalla"| G["✅ Se restaura desde Bundle"]
+    E -->|"navegás afuera y volvés"| F
+```
 
-- `remember`: sobrevive a recomposiciones, pero se pierde si el composable sale de la composición (navegás a otra pantalla y volvés) o si hay un cambio de configuración (rotación de pantalla, cambio de idioma del sistema).
-- `rememberSaveable`: además de sobrevivir recomposiciones, sobrevive cambios de configuración, porque serializa el valor a un mecanismo de persistencia liviano (el `Bundle` en Android, o el equivalente por plataforma en KMP) y lo restaura automáticamente.
+## 2. Qué es y cómo funciona
 
-## 2. El problema que resuelve
+`remember` y `rememberSaveable` son APIs para guardar un valor en memoria dentro de un composable, sobreviviendo a recomposiciones sucesivas. La diferencia entre ambos está en **qué eventos del ciclo de vida sobreviven**, como resume el diagrama: sin ninguno de los dos, una variable local se reinicializa en cada recomposición; con `remember`, sobrevive recomposiciones pero se pierde ante una rotación de pantalla o al salir de la composición; con `rememberSaveable`, además sobrevive el cambio de configuración, porque serializa el valor a un mecanismo de persistencia liviano (el `Bundle` en Android, o el equivalente por plataforma en KMP) y lo restaura automáticamente.
 
 Sin `remember`, cualquier variable local declarada dentro del cuerpo de un composable (`var expanded = false`) se reinicializaría en **cada** recomposición, porque el cuerpo de la función vuelve a ejecutarse de punta a punta — perdiendo cualquier estado de UI efímero cada vez que Compose decide recomponer, aunque sea por un motivo completamente ajeno a esa variable.
 
 `remember` resuelve eso, pero solo dentro de los límites de la composición actual: no protege contra un cambio de configuración, que en Android históricamente recreaba la Activity entera. `rememberSaveable` resuelve ese segundo problema, agregando persistencia real (aunque liviana y temporal) para que el usuario no pierda estado de UI visible al rotar la pantalla — algo que rompería la expectativa básica de continuidad que tiene cualquier usuario.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+En una **app de checklist de viaje**, si cada ítem de la lista tiene un chevron para expandir/colapsar notas adicionales, ese estado de expansión es un candidato típico de `remember`: perderlo al rotar el dispositivo es un detalle menor que el usuario ni siquiera nota como un problema.
+
+En una **app de reserva de turnos**, el formulario donde el usuario completa nombre y motivo de la consulta necesita `rememberSaveable` en cada campo — si el usuario gira el dispositivo a horizontal para ver mejor un selector de fecha y el formulario se vacía, la experiencia se percibe como un bug real, no como un detalle cosmético.
+
+## 4. Implementación real
+
+**El PO pide:** en la pantalla de nuevo pedido, el usuario carga una nota opcional ("dejar en la puerta") en un campo de texto — no debe perderse si rota el dispositivo. Además, cada `OrderItem` de la lista de productos disponibles tiene un ícono de info que se expande al tocarlo — ese detalle sí puede perderse sin problema.
 
 ```kotlin
 @Composable
-fun PlayerCard(player: Player) {
-    // sobrevive recomposiciones, pero se resetea si rotás la pantalla
-    var isExpanded by remember { mutableStateOf(false) }
+fun NewOrderScreen(viewModel: NewOrderViewModel) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
 
-    Card(
-        modifier = Modifier.clickable { isExpanded = !isExpanded }
-    ) {
-        Text(player.name)
-        if (isExpanded) {
-            Text("Score: ${player.score}")
+    // Estado de negocio: vive en el ViewModel, sobrevive rotación
+    // por su propio scope de ciclo de vida — no necesita remember
+    Column {
+        state.availableItems.forEach { item ->
+            AvailableItemRow(item = item)
+        }
+
+        // Estado de UI efímero, con expectativa de continuidad del usuario:
+        // rememberSaveable, porque perder lo tipeado SÍ se percibe como bug
+        var deliveryNote by rememberSaveable { mutableStateOf("") }
+
+        TextField(
+            value = deliveryNote,
+            onValueChange = { deliveryNote = it },
+            label = { Text("Nota de entrega (opcional)") }
+        )
+
+        Button(onClick = { viewModel.onEvent(NewOrderEvent.OnSubmitClicked(deliveryNote)) }) {
+            Text("Confirmar pedido")
         }
     }
 }
 
 @Composable
-fun AddPlayerForm() {
-    // sobrevive recomposiciones Y rotación de pantalla
-    var name by rememberSaveable { mutableStateOf("") }
+fun AvailableItemRow(item: OrderItem) {
+    // Estado puramente visual, efímero: remember alcanza,
+    // perderlo al rotar es un detalle sin impacto real
+    var isInfoExpanded by remember { mutableStateOf(false) }
 
-    TextField(value = name, onValueChange = { name = it })
-}
-```
-
-Si el usuario expande `PlayerCard` (`isExpanded = true`) y rota el dispositivo, la card vuelve a mostrarse colapsada — comportamiento aceptable para un detalle visual menor. Pero si el usuario escribió medio nombre en `AddPlayerForm` con solo `remember` y rota la pantalla, perdería lo tipeado — por eso ahí corresponde `rememberSaveable`.
-
-## 4. Matriz de criterio
-
-**`remember`**
-- Usar cuando: el estado es visual, efímero, y perderlo en una rotación no afecta la experiencia del usuario de forma notoria (si una card está expandida, si un tooltip está visible, un `Animatable` en curso).
-- NO usar cuando: el usuario esperaría razonablemente que ese valor sobreviva a rotar el dispositivo (texto tipeado, un checkbox marcado en un formulario largo).
-
-**`rememberSaveable`**
-- Usar cuando: el estado es de UI pero el usuario lo percibiría como "perdido" si desaparece al rotar — inputs de formulario, posición de scroll relevante, selección en un picker.
-- NO usar cuando: el tipo no es serializable de forma directa (objetos complejos, sin soporte nativo) — ahí hace falta un `Saver` custom, o directamente reconsiderar si ese estado no debería vivir en el `ViewModel` en primer lugar.
-- Trade-off: agrega el costo (mínimo, pero real) de serialización en cada configuración change — normalmente irrelevante para valores primitivos simples.
-
-**`remember`/`rememberSaveable` vs `State` del `ViewModel`**
-- Usar `remember`(`Saveable`) cuando: el estado es puramente de presentación visual, sin relevancia de negocio ni necesidad de sobrevivir más allá de esa pantalla.
-- Usar el `State` del `ViewModel` cuando: el dato tiene relevancia de negocio, necesita persistir más allá de un cambio de configuración (por ejemplo, sobrevivir a que el usuario navegue a otra pantalla y vuelva), o debe ser accedido/testeado fuera de la UI.
-- Trade-off: el `ViewModel` ya sobrevive cambios de configuración por su propio ciclo de vida (ver la pregunta típica más abajo) — así que para datos de negocio, ni siquiera hace falta `rememberSaveable`; el problema que resuelve esa API ya está resuelto de otra forma en ese nivel.
-
-## 5. Caso trampa
-
-```kotlin
-@Composable
-fun AddPlayerScreen(viewModel: AddPlayerViewModel) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-
-    // "para no tener que tocar el ViewModel", el dev usa remember local
-    var localName by remember { mutableStateOf(state.name) }
-
-    TextField(
-        value = localName,
-        onValueChange = { localName = it } // nunca llega al ViewModel
-    )
-
-    Button(onClick = { viewModel.onEvent(AddPlayerEvent.OnSaveClicked(localName)) }) {
-        Text("Guardar")
+    Column(modifier = Modifier.clickable { isInfoExpanded = !isInfoExpanded }) {
+        Text("${item.quantity}x ${item.name}")
+        if (isInfoExpanded) {
+            Text("Info adicional del producto", style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 ```
 
-La trampa: esto "funciona" en el caso feliz — el usuario tipea, toca Guardar, y el nombre se guarda. Pero se rompió el principio de **state hoisting** (`composables_y_state_hoisting.md`) sin que sea obvio a simple vista: `localName` es ahora una segunda fuente de verdad, desincronizada de `state.name`. Si algo más en la pantalla necesita reaccionar al nombre mientras se tipea (validación en vivo, un contador de caracteres calculado en el `ViewModel`, otro composable que muestre un preview), no va a funcionar, porque el `ViewModel` no se entera de cada tecla — solo se entera al final, cuando se toca "Guardar". Además, si la pantalla rota, `remember` reinicializa `localName` con el `state.name` de ese momento (perdiendo lo tipeado sin guardar), mientras que si el flujo fuera `onNameChange` disparando un `Event` hacia el `ViewModel` en cada tecla, el `State` del `ViewModel` ya sobrevive la rotación sin necesitar ningún `remember` en absoluto.
+Si el usuario rota el dispositivo mientras escribe la nota de entrega, `deliveryNote` sobrevive porque usa `rememberSaveable` — el texto tipeado sigue ahí. Si en cambio tenía un ítem expandido con `isInfoExpanded`, esa expansión se resetea al rotar — comportamiento aceptado porque no hay expectativa real del usuario de que ese detalle visual persista.
 
-## 6. Conexión con arquitectura real
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-En Timbax, la pregunta "¿por qué el `State` del `ViewModel` no necesita `rememberSaveable`?" tiene una respuesta arquitectónica concreta: el `ViewModel` sobrevive cambios de configuración por su propio scope de ciclo de vida (atado a la navegación, no a la Activity/Composable en sí — documentado también en `07_coroutines/fundamentos_suspend_scope.md` respecto a `viewModelScope`), así que ese problema ya está resuelto en una capa más arriba. `remember`/`rememberSaveable` en Timbax se reservan exclusivamente para estado que genuinamente nace y muere en la UI (si un diálogo de confirmación está abierto, si una card de historial está expandida) — nunca como atajo para evitar declarar un `Event` nuevo hacia el `ViewModel`.
+Si una IA generó o modificó un composable con `remember`/`rememberSaveable`, revisar:
+
+- **¿Se usó `remember` para un campo de formulario o cualquier input donde el usuario esperaría continuidad al rotar?** Si el valor tipeado se pierde al girar el dispositivo, corresponde `rememberSaveable`, no `remember`.
+- **¿Se usó `remember`/`rememberSaveable` como atajo para un dato que en realidad tiene relevancia de negocio o necesita sobrevivir a la navegación (no solo a la rotación)?** Es el caso trampa más común: un `var localName by remember { mutableStateOf(state.name) }` que nunca llega al `ViewModel` crea una segunda fuente de verdad, rompiendo el principio de **state hoisting** (`composables_y_state_hoisting.md`) — otros composables que necesiten reaccionar en vivo a ese valor (validación, un contador de caracteres, un preview) no se enteran de nada hasta que se dispare el evento final. La corrección es que cada tecla dispare un `Event` hacia el `ViewModel`, no acumular estado local paralelo.
+- **¿Se usa `rememberSaveable` con un tipo que no es serializable de forma directa** (un objeto complejo sin soporte nativo de `Bundle`)? Sin un `Saver` custom, esto falla en runtime o silenciosamente no persiste — revisar que el tipo sea primitivo o tenga un `Saver` explícito.
+- **¿Se está usando `rememberSaveable` para datos que en realidad pertenecen al `State` del `ViewModel`?** El `ViewModel` ya sobrevive cambios de configuración por su propio scope de ciclo de vida (atado a la navegación, no a la Activity/Composable — ver `07_coroutines/coroutines_suspend_scope.md` respecto a `viewModelScope`). Usar `rememberSaveable` para datos de negocio es redundante en el mejor caso, y en el peor introduce una segunda fuente de verdad separada del `State` real.
+- **Regla práctica de auditoría:** `remember`/`rememberSaveable` deberían reservarse exclusivamente para estado que genuinamente nace y muere en la UI (si un diálogo está abierto, si una card está expandida) — nunca como atajo para evitar declarar un `Event` nuevo hacia el `ViewModel`.

@@ -1,36 +1,57 @@
 # theming_material3.md
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-El theming en Material3 es el mecanismo por el cual toda la app comparte una única fuente de verdad para colores, tipografía y formas: un `ColorScheme`, una `Typography` y un `Shapes`, agrupados dentro de un `MaterialTheme` que envuelve toda la app desde la raíz (usualmente en el `App()` composable). Cualquier composable hijo accede a esos valores vía `MaterialTheme.colorScheme.primary`, `MaterialTheme.typography.bodyLarge`, etc., en vez de hardcodear colores o tamaños de fuente sueltos.
+```mermaid
+flowchart TD
+    A["isSystemInDarkTheme()"] --> B{"¿Modo oscuro?"}
+    B -->|"sí"| C["DarkColorScheme"]
+    B -->|"no"| D["LightColorScheme"]
+    C --> E["MaterialTheme<br/>(envuelve App() UNA VEZ)"]
+    D --> E
+    E -->|"CompositionLocal implícito"| F["MaterialTheme.colorScheme.primary"]
+    F --> G["Cualquier composable hijo,<br/>sin recibirlo por parámetro"]
+```
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
+
+El theming en Material3 es el mecanismo por el cual toda la app comparte una única fuente de verdad para colores, tipografía y formas: un `ColorScheme`, una `Typography` y un `Shapes`, agrupados dentro de un `MaterialTheme` que envuelve toda la app desde la raíz (usualmente en el `App()` composable). Cualquier composable hijo accede a esos valores vía `MaterialTheme.colorScheme.primary`, `MaterialTheme.typography.bodyLarge`, etc., en vez de hardcodear colores o tamaños de fuente sueltos — como muestra el diagrama, el `ColorScheme` elegido se propaga implícitamente a cualquier profundidad del árbol, sin que ningún composable intermedio necesite recibirlo ni reenviarlo por parámetro.
 
 Sin un theme centralizado, cada composable definiría sus propios colores y tamaños de texto de forma independiente (`Color(0xFF6200EE)` repetido en 30 archivos distintos). El resultado: inconsistencia visual, y un cambio de paleta (por ejemplo, para soportar modo oscuro) obligaría a tocar cada composable uno por uno.
 
-`MaterialTheme` resuelve esto centralizando la paleta y la tipografía en un solo lugar. Cambiar el `ColorScheme` que se le pasa a `MaterialTheme` en la raíz de la app propaga el cambio a *toda* la UI automáticamente, porque cada composable lee `MaterialTheme.colorScheme.primary` en vez de un valor fijo — el mismo mecanismo de propagación implícita que documentamos en `compositionlocal.md` (de hecho, `MaterialTheme` está construido internamente sobre `CompositionLocal`).
+`MaterialTheme` resuelve esto centralizando la paleta y la tipografía en un solo lugar. Cambiar el `ColorScheme` que se le pasa a `MaterialTheme` en la raíz de la app propaga el cambio a *toda* la UI automáticamente, porque cada composable lee `MaterialTheme.colorScheme.primary` en vez de un valor fijo — el mismo mecanismo de propagación implícita que se documenta en `compositionlocal.md` (de hecho, `MaterialTheme` está construido internamente sobre `CompositionLocal`).
 
-## 3. Ejemplo mínimo comentado
+Los colores semánticos vienen en pares `X`/`onX` (`primary`/`onPrimary`, `surface`/`onSurface`): `onPrimary` siempre es el color de texto/ícono legible *sobre* `primary`, calculado para cumplir accesibilidad, sin que el desarrollador elija manualmente "blanco o negro" cada vez — elegir un color "a ojo" para texto sobre un fondo de color es exactamente el tipo de decisión que el sistema `X`/`onX` reemplaza, evitando bugs de contraste en modo oscuro.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de notas**, el `ColorScheme` custom define un `primary` verdoso para reforzar identidad de marca, y tanto el botón de "Nueva nota" como los headers de sección usan `MaterialTheme.colorScheme.primary` — si más adelante cambia la paleta de marca, ese único cambio en la definición del `ColorScheme` se propaga a toda la app sin tocar un solo composable.
+
+En una **app de fitness**, el modo oscuro no es opcional (mucha gente la usa de noche antes de dormir para revisar su progreso): definir `lightColorScheme`/`darkColorScheme` con pares `X`/`onX` completos desde el día uno evita que, seis meses después, aparezcan pantallas con texto ilegible sobre fondo oscuro porque alguien hardcodeó un color pensando solo en modo claro.
+
+## 4. Implementación real
+
+**El PO pide:** un banner de advertencia en la pantalla de pedido cuando el método de pago falló, que se vea correctamente tanto en modo claro como oscuro.
 
 ```kotlin
-private val TimbaxLightColors = lightColorScheme(
+private val AppLightColors = lightColorScheme(
     primary = Color(0xFF2E7D32),
     onPrimary = Color.White,
     secondary = Color(0xFFFFA000)
 )
 
-private val TimbaxDarkColors = darkColorScheme(
+private val AppDarkColors = darkColorScheme(
     primary = Color(0xFF81C784),
     onPrimary = Color.Black,
     secondary = Color(0xFFFFCA28)
 )
 
 @Composable
-fun TimbaxTheme(
+fun AppTheme(
     useDarkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit
 ) {
-    val colorScheme = if (useDarkTheme) TimbaxDarkColors else TimbaxLightColors
+    val colorScheme = if (useDarkTheme) AppDarkColors else AppLightColors
 
     MaterialTheme(
         colorScheme = colorScheme,
@@ -38,50 +59,45 @@ fun TimbaxTheme(
         content = content
     )
 }
-
-// Uso en cualquier composable de la app, sin importar nada extra:
-@Composable
-fun ScoreLabel(score: Int) {
-    Text(
-        text = "$score",
-        color = MaterialTheme.colorScheme.primary, // nunca Color(0xFF...) hardcodeado
-        style = MaterialTheme.typography.headlineMedium
-    )
-}
 ```
 
-`isSystemInDarkTheme()` lee la preferencia del sistema operativo automáticamente; `TimbaxTheme` decide qué `ColorScheme` aplicar según eso, y todo lo que esté dentro de `content` accede al resultado vía `MaterialTheme.colorScheme` sin saber si está en modo claro u oscuro.
-
-## 4. Matriz de criterio
-
-**`MaterialTheme.colorScheme.X` vs `Color(0xFF...)` hardcodeado**
-- Usar `MaterialTheme.colorScheme` cuando: siempre, salvo un color verdaderamente fijo e independiente del tema (raro — ej: el color exacto de un logo de marca externa que no debe variar).
-- NO hardcodear un color cuando: ese color debería adaptarse a modo claro/oscuro o a un cambio futuro de paleta — hardcodear rompe silenciosamente el modo oscuro (un texto oscuro sobre fondo oscuro, por ejemplo, sin ningún error de compilación).
-- Trade-off: ninguno real en contra de usar el theme — es más código la primera vez (definir la paleta), pero es la única forma de que dark mode "simplemente funcione" en toda la app.
-
-**Colores semánticos (`primary`/`onPrimary`, `surface`/`onSurface`, etc.)**
-- Usar el par `X`/`onX` cuando: necesitás garantizar contraste — `onPrimary` siempre es el color de texto/ícono legible *sobre* `primary`, calculado para cumplir accesibilidad, sin que vos elijas manualmente "blanco o negro" cada vez.
-- NO usar cuando: elegís un color "a ojo" para texto sobre un fondo de color — eso es exactamente el tipo de decisión que el sistema `X`/`onX` reemplaza, evitando bugs de contraste (texto ilegible) en modo oscuro.
-- Trade-off: requiere pensar en pares desde el diseño, no en colores sueltos — más disciplina inicial, pero elimina una clase entera de bugs de accesibilidad.
-
-**Customizar `Typography` vs usar el default de M3**
-- Customizar cuando: la marca/identidad visual de la app requiere una tipografía propia (fuente custom, tamaños específicos).
-- Usar el default cuando: es una app personal, MVP, o donde la identidad tipográfica no es prioridad — el default de M3 ya está pensado con buena legibilidad y jerarquía.
-- Trade-off: customizar tipografía es una única vez al principio del proyecto — hacerlo tarde implica revisar cada `Text` que asumió un `style` del default.
-
-## 5. Caso trampa
-
 ```kotlin
+// Caso trampa (lo que NO hay que hacer): colores hardcodeados
 @Composable
-fun WarningBanner(message: String) {
+fun PaymentFailedBannerBad(message: String) {
     Box(modifier = Modifier.background(Color(0xFFFFF3CD))) { // amarillo hardcodeado
         Text(text = message, color = Color.Black) // negro hardcodeado
     }
 }
 ```
 
-La trampa: en modo claro esto se ve perfecto — fondo amarillo pálido, texto negro legible. Pero como ninguno de los dos colores viene de `MaterialTheme.colorScheme`, cuando el usuario activa modo oscuro, este banner se queda exactamente igual (amarillo claro, texto negro) mientras el resto de la app cambia a paleta oscura — quedando como un parche visual completamente fuera de tono, y potencialmente con contraste incorrecto si el resto del sistema de colores fue pensado para fondos oscuros. El bug no es "se rompe": es peor, "se ve raro mezclado" — algo que un ojo entrenado nota pero que no genera ningún error para debuggear. La regla es usar un color semántico del `ColorScheme` (por ejemplo, `errorContainer`/`onErrorContainer` para un warning), que ya viene resuelto para ambos modos.
+```kotlin
+// Corrección: colores semánticos del ColorScheme, ya resueltos para ambos modos
+@Composable
+fun PaymentFailedBanner(message: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(12.dp)
+    ) {
+        Text(
+            text = message,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.bodyMedium
+        )
+    }
+}
+```
 
-## 6. Conexión con arquitectura real
+`isSystemInDarkTheme()` lee la preferencia del sistema operativo automáticamente; `AppTheme` decide qué `ColorScheme` aplicar según eso, y todo lo que esté dentro de `content` accede al resultado vía `MaterialTheme.colorScheme` sin saber si está en modo claro u oscuro. En la versión corregida del banner, `errorContainer`/`onErrorContainer` ya vienen calculados con el contraste correcto tanto para modo claro como oscuro — a diferencia de la versión `Bad`, que se vería como un parche amarillo fuera de tono en cuanto el usuario active modo oscuro.
 
-En Timbax, `TimbaxTheme` envuelve la función raíz `App()` una sola vez, y desde ahí cada `Screen` (`PlayersScreen`, `AddPlayerForm` de `material3_componentes_comunes.md`) consume `MaterialTheme.colorScheme` sin necesitar recibirlo como parámetro — el mismo mecanismo de propagación implícita de `CompositionLocal` que se documenta en `compositionlocal.md`, aplicado al caso de uso más común y "seguro" de ese mecanismo (tema visual, no lógica de negocio ni navegación). Es, además, la razón por la cual ningún composable de UI en Timbax debería tener un `Color(0xFF...)` suelto: si aparece uno en una revisión de PR, es señal de que se está esquivando el theme en vez de usarlo.
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
+
+Si una IA generó o modificó código con colores o tipografía, revisar:
+
+- **¿Aparece algún `Color(0xFF...)` hardcodeado directamente en un composable de UI**, en vez de `MaterialTheme.colorScheme.algo`? Salvo un caso verdaderamente fijo e independiente del tema (el color exacto de un logo de marca externa), es señal de que se está esquivando el theme en vez de usarlo — y rompe silenciosamente el modo oscuro sin ningún error de compilación.
+- **¿Se usa un color de fondo sin su contraparte `on` correspondiente para el texto/ícono que va encima** (`background(colorScheme.errorContainer)` con `color = Color.Black` en vez de `colorScheme.onErrorContainer`)? Es el bug de contraste más común — el par `X`/`onX` existe justamente para no tener que adivinar manualmente qué color de texto es legible sobre cada fondo.
+- **¿El bug "se ve raro mezclado" en modo oscuro fue descartado por no generar ningún error visible en testing?** Este tipo de bug no crashea ni falla ningún test automático — solo se detecta activando modo oscuro manualmente y mirando la pantalla. Vale la pena revisar cualquier pantalla nueva en ambos modos antes de dar por cerrado un PR.
+- **¿`MaterialTheme` se está envolviendo más de una vez en distintos niveles del árbol** (en vez de una sola vez en la raíz, `App()`)? Aunque técnicamente funcione, reintroduce el mismo problema que el theme centralizado busca evitar — múltiples fuentes de verdad para la paleta.
+- **¿Se customizó `Typography` a mitad de proyecto, después de que ya existían muchos `Text` asumiendo el default de M3?** No es un error de código, pero vale la pena señalarlo como riesgo — revisar cada `style` afectado en vez de asumir que el cambio de tipografía se propaga sin fricciones visuales.
