@@ -1,90 +1,85 @@
-# animaciones_basicas.md
+# accesibilidad_a11y.md
 
 ## 1. Mapa del flujo
 
 ```mermaid
 flowchart TD
-    A["State cambia<br/>(ej: isExpanded)"] --> B{"¿Qué tipo de cambio?"}
-    B -->|"un solo valor<br/>(color, tamaño, alpha)"| C["animate*AsState()"]
-    B -->|"composable entero<br/>aparece/desaparece"| D["AnimatedVisibility"]
-    B -->|"tamaño del contenedor<br/>cambia por su contenido"| E["Modifier.animateContentSize()"]
-    C --> F["Compose interpola<br/>frame a frame"]
-    D --> F
-    E --> F
+    A["Árbol de UI visual"] -->|"Compose genera"| B["Árbol de semántica<br/>(semantics tree)"]
+    B --> C["TalkBack / Switch Access"]
+    D["Componente estándar M3<br/>(Button, Checkbox)"] -->|"semántica automática"| B
+    E["Componente custom<br/>(card compuesta, gesto propio)"] -->|"requiere semántica manual"| B
+    F["clickable() / toggleable()"] -->|"registra acción onClick<br/>en el árbol semántico"| B
+    G["pointerInput + detectTapGestures"] -.->|"⚠️ NO registra<br/>ninguna acción semántica"| B
 ```
 
 ## 2. Qué es y cómo funciona
 
-Compose ofrece un set de APIs de animación de alto nivel, pensadas para cubrir la gran mayoría de casos comunes sin necesitar manejar interpolación manual de valores: `animate*AsState()` (una familia de funciones: `animateFloatAsState`, `animateColorAsState`, `animateDpAsState`, etc.) para animar un solo valor entre dos estados; `AnimatedVisibility` para animar la entrada/salida de un composable completo; y `animateContentSize()`, un `Modifier` que anima automáticamente el cambio de tamaño de un composable cuando su contenido cambia — como resume el diagrama, las tres parten del mismo cambio de `State` y solo difieren en *qué tipo de cambio visual* están animando.
+Accesibilidad (a11y) es el conjunto de prácticas y APIs que permiten que una app sea usable por personas con discapacidades visuales, motoras o cognitivas, típicamente a través de servicios de asistencia como TalkBack (el lector de pantalla de Android) o Switch Access (navegación sin tocar la pantalla, vía switches físicos o gestos de barrido). En Compose, la pieza central es el **árbol de semántica** (semantics tree): un árbol paralelo al árbol de UI visual que describe el "significado" de cada elemento (es un botón, dice "Favorito", está seleccionado) para que los servicios de accesibilidad puedan interpretarlo sin necesidad de "ver" píxeles — como muestra el diagrama, los componentes estándar de Material3 generan esa semántica automáticamente, pero un componente custom o un gesto de bajo nivel no.
 
-Todas comparten la misma idea de fondo: en vez de escribir la animación como una secuencia de pasos imperativos, se declara el **valor objetivo** (`targetValue`) y Compose se encarga de interpolar suavemente desde el valor actual hasta ese objetivo cada vez que cambia.
+Sin un árbol de semántica explícito, un lector de pantalla no tiene forma de saber qué es cada elemento visual: un ícono es solo un conjunto de píxeles, un `Row` con texto e ícono son elementos sueltos sin relación aparente entre sí. Compose construye automáticamente semántica razonable para los componentes estándar (un `Button` ya se anuncia como botón, un `Text` lee su contenido), pero en cuanto se arma algo custom (una card compuesta por ícono + texto + badge, un gráfico, un gesto propio), esa semántica automática no alcanza y hay que describirla a mano — si no se hace, la app queda invisible o confusa para cualquiera que dependa de TalkBack/Switch Access, lo cual además de ser una barrera real es, en mercados como la UE, un requisito legal (European Accessibility Act, vigente desde 2025).
 
-Animar manualmente en un sistema imperativo implica gestionar un timer, calcular manualmente los valores intermedios frame a frame, y sincronizar eso con el render — mucho código repetitivo para casos que en la práctica son muy comunes (un color que cambia suavemente, un elemento que aparece con fade, una card que se expande).
+**Criterios de auditoría clave:**
 
-Las animate-APIs de Compose resuelven esto reduciendo la animación a una declaración: "cuando este valor cambia, quiero que la transición sea animada, no instantánea". Compose se encarga de todo el trabajo de interpolación y de disparar recomposición en cada frame intermedio de la animación.
-
-**Criterio de elección:**
-
-- **`animate*AsState()`**: animar un único valor simple (color, tamaño, alpha, offset) entre dos estados conocidos — la opción de menor esfuerzo para el caso más común. Para coordinar varias animaciones relacionadas con timing preciso, corresponde `Animatable` o `updateTransition`, APIs de nivel más bajo que exceden el alcance de este archivo introductorio.
-- **`AnimatedVisibility`**: un composable completo debe aparecer/desaparecer de forma animada en respuesta a un `Boolean` — reemplaza un `if (visible) { Content() }` abrupto por una transición real (fade, slide, expand). Si el composable simplemente no debería estar en el árbol en absoluto (una feature flag deshabilitada permanentemente), un `if` normal alcanza y es más simple.
-- **`Modifier.animateContentSize()`**: cuando el contenido interno de un composable puede cambiar de tamaño (texto que se expande, una lista que crece) y se prefiere una transición suave del contenedor en vez de un salto brusco. No conviene cuando el cambio de tamaño es tan frecuente o grande que la animación constante se siente como ruido visual (por ejemplo, contenido que cambia de tamaño en cada frame de scroll).
-- **Duración/easing por default vs custom**: usar los defaults cuando no hay una razón de diseño específica para desviarse — ya están pensados para sentirse naturales en la mayoría de los casos. Customizar (`animationSpec = tween(300, easing = FastOutSlowInEasing)` o `spring(...)`) cuando el sistema de diseño define timings específicos, o el default se siente demasiado lento/rápido para ese caso puntual.
+- **`contentDescription = null` vs. una descripción real**: `null` cuando el ícono es puramente decorativo o ya está acompañado de un texto que comunica lo mismo (evita redundancia al lector de pantalla). Una descripción real cuando el elemento es la única fuente de información de esa acción — y debe describir la **acción** ("Eliminar el pedido"), no el ícono en sí ("ícono de tacho de basura").
+- **`Modifier.semantics(mergeDescendants = true)`**: cuando varios elementos hijos (ícono + texto + badge) forman conceptualmente una sola unidad de información. Los modifiers estándar (`clickable`, `toggleable`) declaran su propia semántica y quedan automáticamente protegidos de ser absorbidos por el merge del padre — pero un gesto custom de bajo nivel, sin semántica propia, sí puede quedar silenciosamente tragado dentro del nodo mergeado (ver sección 4).
+- **Touch target mínimo (48dp)**: por default con componentes de Material (`IconButton`, `Checkbox`), que ya aplican automáticamente una región de touch invisible de al menos 48dp. Ajustarlo manualmente cuando se arma un componente completamente custom con `Modifier.clickable` sobre algo visualmente más chico, o cuando varios elementos chicos quedan muy juntos entre sí.
+- **`clearAndSetSemantics {}` vs. `semantics {}`**: `semantics {}` para **agregar** información sin pisar lo que Compose ya generó automáticamente — el caso general. `clearAndSetSemantics {}` para **reemplazar por completo** la semántica de un nodo y sus descendientes — poderosa pero peligrosa, borra toda la semántica previa incluida la de los hijos, así que se recomienda con moderación.
 
 ## 3. Cómo se ve en distintos contextos
 
-En una **app de meditación**, el círculo de respiración que se expande y contrae usa `animateFloatAsState` sobre el radio, con un `animationSpec = tween(...)` custom lo suficientemente lento como para sentirse orgánico — un caso donde los defaults de Compose serían demasiado rápidos para la sensación que la app busca transmitir.
+En una **app de banca**, cada fila del resumen de movimientos agrupa monto, fecha y descripción con `mergeDescendants = true` para que TalkBack la anuncie como una sola unidad coherente ("Transferencia a Juan, $5000, 15 de agosto") en vez de tres anuncios sueltos y descontextualizados.
 
-En una **app de e-commerce**, agregar un producto al carrito dispara un pequeño ícono que aparece con `AnimatedVisibility` sobre el botón de carrito (fade + scale), dando feedback visual inmediato sin necesidad de un snackbar — la card del producto en sí usa `animateContentSize()` cuando se expande para mostrar variantes de talle disponibles.
+En una **app de fotos**, un botón de "Me gusta" implementado solo con ícono (sin texto visible) requiere `contentDescription` obligatorio describiendo la acción ("Me gusta esta foto"), mientras que el ícono decorativo de una cámara junto al texto "Tomar foto" en otro botón puede llevar `contentDescription = null`, porque el texto ya comunica la acción completa.
 
 ## 4. Implementación real
 
-**El PO pide:** en la lista de pedidos, cuando un pedido cambia a estado "entregado", la fila debe resaltarse con un color verde suave que aparece con transición, y el detalle expandido debe crecer/achicarse de forma animada en vez de saltar abruptamente.
+**El PO pide:** en la fila de cada pedido del historial, un ícono de "más info" que expande detalles al tocarlo — debe funcionar correctamente con TalkBack activado.
 
 ```kotlin
+// Caso trampa (lo que NO hay que hacer): gesto custom sin semántica de acción
 @Composable
-fun OrderRow(
-    order: Order,
-    isExpanded: Boolean,
-    onToggleExpand: (String) -> Unit
-) {
-    // 1. animateColorAsState: interpola el color cada vez que order.status cambia
-    val backgroundColor by animateColorAsState(
-        targetValue = if (order.status == OrderStatus.DELIVERED)
-            MaterialTheme.colorScheme.primaryContainer
-        else MaterialTheme.colorScheme.surface,
-        label = "orderRowBackground"
-    )
-
-    Card(
-        modifier = Modifier
-            .clickable { onToggleExpand(order.id) }
-            .animateContentSize(), // 3. anima el cambio de tamaño al expandir/colapsar
-        colors = CardDefaults.cardColors(containerColor = backgroundColor)
+fun OrderRowBad(order: Order, onExpandInfo: () -> Unit) {
+    Row(
+        modifier = Modifier.semantics(mergeDescendants = true) {}
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text("Pedido #${order.id}")
-
-            // 2. AnimatedVisibility: anima la entrada/salida del detalle
-            AnimatedVisibility(visible = isExpanded) {
-                Column {
-                    order.items.forEach { item ->
-                        Text("${item.quantity}x ${item.name}")
-                    }
-                }
+        Text("Pedido #${order.id}")
+        Icon(
+            Icons.Filled.Info,
+            contentDescription = "Ver más info",
+            modifier = Modifier.pointerInput(Unit) {
+                detectTapGestures { onExpandInfo() } // gesto custom, sin clickable()
             }
-        }
+        )
     }
 }
 ```
 
-Cuando `order.status` cambia a `DELIVERED` (viene del `State` del `ViewModel`, no de un `remember` local — ver `composables_y_state_hoisting.md`), tres cosas animan a la vez: el color de fondo interpola suavemente (`animateColorAsState`), el detalle de ítems aparece/desaparece con transición al expandir (`AnimatedVisibility`), y el tamaño de la `Card` se ajusta de forma animada al nuevo contenido (`animateContentSize()`) — sin que el desarrollador haya escrito ningún cálculo de interpolación a mano.
+```kotlin
+// Corrección: clickable() registra la acción semántica automáticamente
+@Composable
+fun OrderRow(order: Order, onExpandInfo: () -> Unit) {
+    Row(
+        modifier = Modifier.semantics(mergeDescendants = true) {}
+    ) {
+        Text("Pedido #${order.id}")
+        Icon(
+            Icons.Filled.Info,
+            contentDescription = "Ver más info del pedido #${order.id}",
+            modifier = Modifier.clickable(onClick = onExpandInfo) // registra onClick semántico
+        )
+    }
+}
+```
+
+Para un usuario sin discapacidad, ambas versiones funcionan idéntico: tocás el ícono, se dispara `onExpandInfo()`. El problema aparece con TalkBack activado. `clickable`/`toggleable` no son solo manejo de gestos — internamente también registran una acción de accesibilidad (`onClick`) en el árbol de semántica, que es lo que le permite a TalkBack ofrecer "doble tap para activar" sobre ese elemento. `pointerInput` + `detectTapGestures` es pura detección de gesto de bajo nivel: no registra ninguna acción semántica. En la versión `Bad`, la fila entera se mergea y TalkBack anuncia "Pedido #123. Ver más info." — el `contentDescription` del ícono queda absorbido como texto informativo dentro del nodo mergeado, pero no existe ninguna acción activable adjunta a esa parte. El usuario escucha que "hay más info" pero no tiene forma de pedirla: la funcionalidad existe visualmente y funciona al tacto, pero es invisible y no-operable para quien navega con TalkBack.
 
 ## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-Si una IA generó o modificó código con intención de animación, revisar:
+Si una IA generó o modificó código con elementos interactivos o informativos, revisar:
 
-- **¿Hay una variable nombrada como si animara (`animatedColor`, `animatedSize`) pero en realidad es un `if`/cálculo directo evaluado en cada recomposición?** Es el error más común y engañoso — el nombre sugiere una transición suave, pero el valor salta instantáneamente entre estados sin ninguna interpolación real. La corrección es envolver la expresión en la animate-API correspondiente (`animateColorAsState(targetValue = ...)`), no solo nombrar la variable como si estuviera animada.
-- **¿El valor que se anima viene del `State` del `ViewModel`, o de un estado local inventado solo para la animación?** Las animate-APIs son la capa final, puramente visual, sobre un valor que el `State` ya decidió — la animación nunca debería decidir *qué* mostrar, solo *cómo* transiciona algo que ya viene resuelto desde arriba.
-- **¿Se usa `AnimatedVisibility` para contenido que en realidad nunca debería estar en el árbol** (una feature deshabilitada permanentemente, no un estado que cambia dinámicamente)? Ahí un `if` simple es más apropiado — `AnimatedVisibility` agrega composición extra sin beneficio si no hay una transición real que mostrar.
-- **¿Se usa `animateContentSize()` en un composable cuyo tamaño cambia en cada frame** (por ejemplo, ligado directamente a la posición de scroll)? La animación constante en ese caso se siente como ruido visual, no como ayuda — revisar si el cambio de tamaño es genuinamente discreto (aparece/desaparece un bloque) o continuo.
-- **¿Se customizó `animationSpec` sin una razón de diseño concreta?** Los defaults de Compose ya están pensados para sentirse naturales — una customización sin justificación (un `tween` con duración arbitraria) puede ser señal de que se está ajustando "a ojo" en vez de seguir un sistema de diseño consistente.
+- **¿Hay un `Modifier.pointerInput`/`detectTapGestures` usado para algo interactuable, sin `Modifier.clickable()` o sin `Modifier.semantics { onClick { } }` explícito?** Es la señal de alarma más importante de este archivo — pasa cualquier QA manual con el dedo sin levantar sospechas, y solo se detecta probando la pantalla con TalkBack activado.
+- **¿Un ícono decorativo (acompañado de texto que ya comunica la misma acción) tiene un `contentDescription` real en vez de `null`?** Genera redundancia: TalkBack lee dos veces la misma información ("Estrella. Marcar favorito." en vez de solo "Marcar favorito.").
+- **¿Un `IconButton` sin texto visible tiene `contentDescription = null` o ausente?** Es el error inverso — sin descripción, ese botón es completamente invisible para TalkBack.
+- **¿Una `contentDescription` describe el ícono en sí ("ícono de tacho de basura") en vez de la acción ("Eliminar pedido")?** Es una descripción técnicamente presente pero de bajo valor real para quien la escucha.
+- **¿Se usó `clearAndSetSemantics {}` cuando `semantics {}` (agregar) hubiera alcanzado?** `clearAndSetSemantics` borra toda la semántica previa, incluida la de los hijos — usarla de más deja huecos de información reales que antes existían automáticamente.
+- **¿Un componente completamente custom (no basado en Material3) tiene un área táctil menor a 48dp, o varios elementos chicos quedan pegados entre sí sin espaciado?** Componentes estándar de Material ya resuelven esto automáticamente; un componente armado desde cero con `Modifier.clickable` sobre algo visualmente chico necesita ese ajuste manual.
