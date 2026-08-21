@@ -1,59 +1,97 @@
 # Data Class
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Una `data class` genera automáticamente `equals()`/`hashCode()` (comparación por valor de sus propiedades, no por referencia), `toString()` legible, y `copy()` (crear una copia modificando solo algunos campos).
-
-```kotlin
-data class Player(val id: String, val name: String, val score: Int)
+```mermaid
+flowchart TD
+    DECL["data class Order(...)"] -->|compilador genera| EQ["equals() / hashCode()<br/>comparación por valor"]
+    DECL -->|compilador genera| TS["toString()<br/>legible para debug/logs"]
+    DECL -->|compilador genera| CP["copy()<br/>nueva instancia parcial"]
+    DECL -->|compilador genera| CN["componentN()<br/>destructuring"]
+    CP -->|usado en| REDUCER["reducer / State update<br/>_state.update { it.copy(...) }"]
+    EQ -->|usado en| RECOMP["Compose<br/>¿recomponer o skip?"]
+    CN -->|usado en| DESTR["val (id, name) = player"]
 ```
 
-## 2. El problema que resuelve
+Los cuatro métodos no son opcionales ni configurables uno por uno — vienen todos juntos apenas ponés la palabra `data` antes de `class`. Lo que cambia según el contexto es cuál de los cuatro termina siendo el que realmente usás en cada capa: `copy()` domina en reducers de MVI, `equals()` domina en la decisión de recomposición de Compose, `componentN()` aparece sobre todo en destructuring declarations puntuales.
 
-Sin `data class`, cada clase que solo transporta datos obligaría a escribir a mano `equals()`, `hashCode()` y `toString()` — código repetitivo, propenso a errores (olvidar actualizar `equals()` cuando agregás una propiedad nueva), y sin ninguna forma cómoda de crear una copia parcial de una instancia inmutable sin reescribir todos sus campos uno por uno.
+## 2. Qué es y cómo funciona
 
-## 3. Ejemplo mínimo comentado
+Una `data class` es una clase donde el compilador de Kotlin genera automáticamente, a partir de las propiedades declaradas en el constructor primario, cuatro cosas: `equals()`/`hashCode()` (comparación por valor de esas propiedades, no por referencia), `toString()` (una representación legible tipo `Order(id=1, status=PENDING, ...)`), `copy()` (crear una nueva instancia cambiando solo algunos campos, reusando el resto) y `componentN()` (una función por cada propiedad del constructor, que habilita destructuring: `val (id, status) = order`).
 
-```kotlin
-data class Player(val id: String, val name: String, val score: Int)
+Como muestra el diagrama, estos cuatro métodos no viven aislados — son la base sobre la que se apoyan patrones enteros de arquitectura. `copy()` es lo que permite que un `State` inmutable (`data class OrdersState(...)`) se actualice sin reescribir todos sus campos: `_state.update { it.copy(isLoading = false) }` crea una instancia nueva, deja el resto intacto. `equals()` por valor es lo que le permite a Compose comparar el `State` viejo contra el nuevo en cada recomposición y decidir si hay un cambio real o si puede saltear (skip) el trabajo de recomponer — sin esa comparación por valor, dos instancias con los mismos datos se verían como "distintas" solo por ser objetos diferentes en memoria, y Compose recompondría de más.
 
-val updated = player.copy(score = player.score + 10)  // nueva instancia, mismo id/name
-```
+Una propiedad importante que se desprende de esto: **`copy()` es shallow copy**. Si una propiedad del `data class` es en sí misma un objeto mutable, `copy()` no lo clona — copia la referencia. Esto no es un bug, es la definición de shallow copy, pero genera bugs sutiles si se asume inmutabilidad total sin verificar que todas las propiedades anidadas también lo sean.
 
-```kotlin
-// equals por valor, no por referencia
-val a = Player("1", "Tiago", 10)
-val b = Player("1", "Tiago", 10)
-println(a == b)   // true — compara valores, no identidad de objeto
-println(a === b)  // false — son instancias distintas en memoria
-```
+## 3. Cómo se ve en distintos contextos
 
-## 4. Matriz de criterio
+**App de fitness:** el `State` de la pantalla de rutina activa (`data class WorkoutState(val currentSet: Int, val isResting: Boolean, val elapsedSeconds: Int)`) se actualiza en un timer que corre cada segundo — `_state.update { it.copy(elapsedSeconds = it.elapsedSeconds + 1) }`. Sin `copy()`, cada tick del timer obligaría a reconstruir manualmente el objeto entero repitiendo `currentSet` e `isResting` sin cambios, solo para tocar un campo.
 
-**Usar `data class` cuando:** la clase existe principalmente para transportar datos, y la igualdad por valor tiene sentido semántico (dos instancias con los mismos campos representan "lo mismo").
+**App de e-commerce:** un carrito (`data class Cart(val items: MutableList<CartItem>)`) es el ejemplo clásico donde la trampa de shallow copy aparece — dos vistas distintas del carrito que hicieron `cart.copy()` para "aislar" sus cambios en realidad comparten la misma `MutableList` por debajo, así que agregar un item desde una vista lo hace aparecer también en la otra, algo que nadie esperaría de un `copy()`.
 
-**NO usar `data class` cuando:** la igualdad por valor no tiene sentido en el dominio — por ejemplo, una clase que representa una conexión activa a un socket, donde dos conexiones con los mismos parámetros no son "la misma conexión" (ahí importa la identidad, no el valor).
+## 4. Implementación real
 
-**NO usar `data class` cuando:** la clase tiene lógica de comportamiento compleja más que solo transportar datos — una clase regular comunica mejor la intención de que el foco está en el comportamiento, no en los datos.
-
-**Trade-off real:** `copy()` es cómodo pero solo hace shallow copy — si una propiedad es un objeto mutable, `copy()` no lo clona, solo copia la referencia. Esto puede generar bugs sutiles si asumís inmutabilidad total sin verificar que todas las propiedades anidadas también sean inmutables.
-
-## 5. Caso trampa
-
-Asumir que `copy()` protege completamente contra mutación compartida cuando alguna propiedad es una colección mutable:
+El PO pide: *"Necesito el Historial de Pedidos: cada pedido tiene una fecha, un estado, un total, y una lista de items."* — el mismo caso que ya modelamos en `domain` (`02_domain/model.md`). Acá el foco es distinto: no qué representa el Model, sino qué te da gratis el compilador al declararlo como `data class`, y dónde se usa cada pieza en la práctica.
 
 ```kotlin
-data class Team(val name: String, val players: MutableList<Player>)
+// domain/model/Order.kt
+data class Order(
+    val id: String,
+    val date: Instant,
+    val status: OrderStatus,
+    val items: List<OrderItem>,
+    val total: Double
+)
 
-val teamA = Team("Rojo", mutableListOf(player1))
-val teamB = teamA.copy(name = "Azul")
-
-teamB.players.add(player2)
-// teamA.players TAMBIÉN cambia — copy() copió la REFERENCIA a la misma MutableList
+data class OrderItem(
+    val productName: String,
+    val quantity: Int,
+    val unitPrice: Double
+)
 ```
 
-La forma correcta es usar `List` inmutable (no `MutableList`) en el `data class`, o clonar explícitamente la colección dentro de `copy()`.
+`equals()`/`hashCode()` por valor en la práctica — dos `Order` con los mismos datos son "el mismo pedido" a los ojos del código, aunque sean instancias distintas en memoria:
 
-## 6. Conexión con arquitectura real (Timbax)
+```kotlin
+val orderFromCache = Order("1", date, OrderStatus.PENDING, items, 45.0)
+val orderFromApi = Order("1", date, OrderStatus.PENDING, items, 45.0)
 
-En Timbax, el `State` de cada Contract MVI es siempre una `data class` — es precisamente lo que permite `_state.update { it.copy(isLoading = false) }` para producir un nuevo estado inmutable a partir del anterior sin reescribir todos los campos. Además, `equals()` por valor es lo que le permite a Compose comparar si el `State` realmente cambió entre una recomposición y otra, y decidir si vale la pena recomponer o saltear (skip).
+println(orderFromCache == orderFromApi)   // true — compara valores
+println(orderFromCache === orderFromApi)  // false — instancias distintas
+```
+
+`copy()` en el reducer del `OrdersViewModel`, actualizando un solo campo del `State` (definido en `06_presentation_mvi/screencontract_state_event_effect.md`) sin tocar el resto:
+
+```kotlin
+fun onOrderConfirmed(orderId: String) {
+    _state.update { current ->
+        current.copy(
+            orders = current.orders.map { order ->
+                if (order.id == orderId) order.copy(status = OrderStatus.CONFIRMED)
+                else order
+            }
+        )
+    }
+}
+```
+
+Notá el `copy()` anidado: se actualiza el `status` de un `Order` puntual dentro de la lista, y ese resultado se usa para actualizar el `orders` del `OrdersState` completo — dos niveles de `copy()`, cada uno tocando solo lo que cambió.
+
+`componentN()` habilitando destructuring, útil cuando solo interesan un par de campos:
+
+```kotlin
+val (id, _, status) = order
+println("Pedido $id está en estado $status")
+```
+
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
+
+- **¿Alguna propiedad del `data class` es una colección mutable (`MutableList`, `MutableMap`) en vez de inmutable (`List`, `Map`)?** Si la IA usó `MutableList` en un Model o un `State`, `copy()` va a compartir la referencia entre instancias — dos `State` "distintos" van a mutar juntos apenas alguien modifica la lista de uno. La corrección es usar tipos inmutables (`List`) y reasignar la lista completa en el `copy()`, nunca mutarla in-place.
+
+- **¿El `data class` tiene lógica de negocio real más allá de transportar datos, y esa lógica pertenece ahí?** Un método propio como `Order.isEditable(): Boolean = status == OrderStatus.PENDING` es legítimo si la lógica es intrínseca al concepto. Lo que hay que marcar es lógica de presentación (formateo de texto, colores, strings de UI) colada dentro de un Model de domain — esa lógica no pertenece ahí.
+
+- **¿Se está comparando por `===` (identidad) cuando la intención era comparar por valor, o viceversa?** Un `if (orderA === orderB)` donde la intención real era "¿son el mismo pedido con los mismos datos?" es casi siempre un bug — debería ser `==`. El caso inverso (usar `==` cuando realmente se necesita distinguir instancias, por ejemplo para invalidar una caché) es más raro pero también hay que chequearlo si aparece.
+
+- **¿Todos los constructores secundarios o factory functions siguen produciendo instancias que `equals()` considera coherentes?** Si el `data class` tiene un `companion object` con una función tipo `Order.empty()`, verificar que dos llamadas a esa función produzcan instancias iguales entre sí si esa es la intención — un campo con valor aleatorio o timestamp actual en el constructor rompe esa expectativa silenciosamente.
+
+- **¿Hay algún campo que debería excluirse de `equals()`/`hashCode()` (por ejemplo, un campo puramente de UI o de caché) y no se usó `data class` con propiedades fuera del constructor primario para lograrlo?** Solo las propiedades declaradas en el constructor primario entran en el `equals()`/`hashCode()`/`copy()` generados — si la IA declaró una propiedad mutable con `var` dentro del cuerpo de la clase pensando que también participaría de la igualdad, no es así, y puede generar bugs de comparación silenciosos.

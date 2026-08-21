@@ -1,64 +1,92 @@
 # Sealed Class / Sealed Interface
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-`sealed class` / `sealed interface` restringen una jerarquía de tipos a un conjunto cerrado y conocido en tiempo de compilación — todas las subclases están declaradas en el mismo módulo/paquete. Esto permite que un `when` sobre un sealed type sea exhaustivo: el compilador obliga a cubrir todos los casos posibles, sin necesitar un `else`.
+```mermaid
+flowchart TD
+    UI["UI envía acción"] -->|"OnRefresh, OnOrderClicked(id)"| EVENT["OrdersEvent<br/>sealed interface"]
+    EVENT --> WHEN1["when (event) { ... }<br/>exhaustivo — sin else"]
+    WHEN1 --> VM["ViewModel ejecuta lógica"]
+    VM -->|"emite una vez"| EFFECT["OrdersEffect<br/>sealed interface"]
+    EFFECT --> WHEN2["when (effect) { ... }<br/>exhaustivo — sin else"]
+    WHEN2 --> UI2["UI reacciona<br/>(navega, muestra snackbar)"]
+```
+
+`Event` y `Effect` entran y salen del ViewModel por caminos separados, pero ambos pasan por el mismo mecanismo: un `when` exhaustivo sobre un tipo sellado. El diagrama remarca que ese `when` nunca necesita `else` — es el compilador, no una convención de estilo, el que garantiza que no falta ningún caso.
+
+## 2. Qué es y cómo funciona
+
+`sealed class` / `sealed interface` restringen una jerarquía de tipos a un conjunto cerrado y conocido en tiempo de compilación — todas las subclases están declaradas en el mismo módulo/paquete. Esto permite que un `when` sobre un sealed type sea **exhaustivo**: el compilador obliga a cubrir todos los casos posibles, sin necesitar un `else`.
 
 ```kotlin
-sealed interface UiState {
-    object Loading : UiState
-    data class Success(val players: List<Player>) : UiState
-    data class Error(val message: String) : UiState
+sealed interface OrdersEvent {
+    data object OnRefresh : OrdersEvent
+    data class OnOrderClicked(val orderId: String) : OrdersEvent
 }
 ```
 
-## 2. El problema que resuelve
+Como muestra el diagrama, el valor real de sellar un tipo no es solo organizativo — es que el compilador queda como garante de que ningún caso se procesa "en silencio". Si mañana se agrega un caso nuevo a `OrdersEvent` (por ejemplo `OnRetryClicked`), cada `when` exhaustivo que consuma ese tipo en todo el repo deja de compilar hasta que se agregue la rama correspondiente — el error aparece en compile-time, en el lugar exacto donde falta manejarlo, no como un bug silencioso en runtime.
 
-Sin un tipo cerrado, modelar "los posibles estados de una pantalla" con clases sueltas o un enum no le da al compilador ninguna garantía sobre qué implementaciones existen. Si mañana agregás un caso nuevo, nada te avisa qué `when` quedaron desactualizados — el bug aparece en runtime (un caso no contemplado que cae en un `else` genérico o ni siquiera se maneja) en vez de aparecer como error de compilación.
+`sealed interface` es la opción por defecto hoy: no requiere estado común compartido en una superclase, y permite que una subclase implemente esta jerarquía junto con otra (herencia múltiple de tipos, algo que `sealed class` no permite por ser clase). `sealed class` sigue siendo necesaria cuando sí hace falta una propiedad o comportamiento común implementado en la superclase que todas las subclases heredan — por ejemplo, un `abstract val timestamp: Long` con lógica compartida entre todos los casos.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness:** `WorkoutEffect` es `sealed interface` con `PlayCompletionSound` y `NavigateToSummary` — cosas que pasan una sola vez (un sonido, una navegación) y no tienen sentido como parte de un `State` persistente. Si mañana se agrega `ShowPersonalRecordBanner`, el `when` que consume `WorkoutEffect` en la UI deja de compilar hasta que se contemple el caso nuevo — nadie puede "olvidarse" de manejarlo.
+
+**App de e-commerce:** `PaymentMethod` es un caso típico donde un `enum` no alcanza y hace falta `sealed interface` — `CreditCard(val lastFourDigits: String)` lleva datos que `CashOnDelivery` no tiene, y cada variante necesita propiedades distintas. Un `enum` obliga a que todos los valores tengan la misma forma; acá cada método de pago es conceptualmente distinto, no una simple etiqueta.
+
+## 4. Implementación real
+
+El PO pide: *"En la pantalla de Historial de Pedidos, el usuario puede pedir un refresh, reintentar si falló, o tocar un pedido para ver el detalle. Cuando toca un pedido hay que navegar; si el refresh falla pero ya había datos previos, mostrar un aviso puntual sin perder la lista vieja."*
 
 ```kotlin
-sealed interface UiState {
-    object Loading : UiState
-    data class Success(val players: List<Player>) : UiState
-    data class Error(val message: String) : UiState
+// OrdersContract.kt
+
+sealed interface OrdersEvent {
+    data object OnRefresh : OrdersEvent
+    data object OnRetryClicked : OrdersEvent
+    data class OnOrderClicked(val orderId: String) : OrdersEvent
 }
 
-when (state) {
-    is UiState.Loading -> showSpinner()
-    is UiState.Success -> showList(state.players)
-    is UiState.Error -> showError(state.message)
-    // no hace falta "else" — el compilador sabe que estos son todos los casos posibles
+sealed interface OrdersEffect {
+    data class NavigateToOrderDetail(val orderId: String) : OrdersEffect
+    data class ShowSnackbar(val message: String) : OrdersEffect
 }
 ```
 
-## 4. Matriz de criterio
-
-**Usar `sealed interface` cuando:** no necesitás estado común compartido en la superclase, y/o una clase necesita implementar esta jerarquía junto con otra (herencia múltiple de tipos, algo que `sealed class` no permite por ser clase). Es la opción preferida hoy por defecto.
-
-**Usar `sealed class` cuando:** sí necesitás una propiedad o comportamiento común implementado en la superclase que todas las subclases heredan (por ejemplo, un `abstract val timestamp: Long` con lógica compartida).
-
-**NO usar un `enum` cuando:** cada caso necesita llevar datos distintos — un enum no puede modelar eso, porque todos sus valores tienen la misma "forma" (mismas propiedades). `Error(message: String)` lleva un dato que `Loading` no tiene; eso es imposible de modelar limpio con enum.
-
-**NO usar clases sueltas sin sellar cuando:** el conjunto de casos es finito y conocido de antemano (State, Event, Effect de MVI) — ahí perdés la exhaustividad del `when` y el chequeo del compilador.
-
-**Trade-off real:** sealed types dan seguridad en compile-time pero requieren que todas las subclases estén en el mismo paquete/módulo (según la versión de Kotlin) — si necesitás que terceros externos extiendan la jerarquía libremente, sealed no es la herramienta correcta (ahí una interfaz abierta común tiene más sentido).
-
-## 5. Caso trampa
-
-Agregar un `else` "por las dudas" en un `when` exhaustivo sobre un sealed type parece inofensivo, pero elimina justamente la garantía que sealed te da:
+Consumo exhaustivo de `OrdersEvent` en el ViewModel — cada rama del `when` es obligatoria, el compilador no permite omitir ninguna:
 
 ```kotlin
-when (state) {
-    is UiState.Loading -> showSpinner()
-    is UiState.Success -> showList(state.players)
-    else -> {} // ⚠️ silenciosamente absorbe Error, y cualquier caso futuro
+fun onEvent(event: OrdersEvent) {
+    when (event) {
+        OrdersEvent.OnRefresh -> refreshOrders()
+        OrdersEvent.OnRetryClicked -> refreshOrders()
+        is OrdersEvent.OnOrderClicked -> emitEffect(
+            OrdersEffect.NavigateToOrderDetail(event.orderId)
+        )
+    }
 }
 ```
 
-Si mañana se agrega `UiState.Empty`, el compilador ya no te avisa que falta manejarlo — cae directo en el `else` sin que nadie lo note. La forma correcta es cubrir cada caso explícitamente y dejar que el compilador marque error si falta uno.
+Notá la diferencia entre `data object` (para `OnRefresh`/`OnRetryClicked`, que no llevan datos — un singleton sin estado) y `data class` (para `OnOrderClicked`, que sí necesita cargar el `orderId`). Ambos participan igual del `when` exhaustivo; la elección entre uno y otro depende únicamente de si el caso lleva datos propios o no.
 
-## 6. Conexión con arquitectura real (Timbax)
+Consumo del lado de la UI, reaccionando a `OrdersEffect` una sola vez por emisión (patrón completo de colección de `Effect` en `06_presentation_mvi/viewmodel.md`):
 
-En Timbax, el Contract de MVI (`State` / `Event` / `Effect`) usa `sealed interface` para `Event` y `Effect` en cada feature — por ejemplo, `PlayersEvent` con `OnPlayerClicked`, `OnRefresh`, etc. El `reduce`/`onEvent` del ViewModel es un `when` exhaustivo sobre ese sealed interface: si se agrega un nuevo `Event`, el compilador marca error en cada ViewModel que no lo contempla, evitando que una acción de usuario quede sin manejar silenciosamente.
+```kotlin
+when (effect) {
+    is OrdersEffect.NavigateToOrderDetail -> navController.navigate("order/${effect.orderId}")
+    is OrdersEffect.ShowSnackbar -> snackbarHostState.showSnackbar(effect.message)
+}
+```
+
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
+
+- **¿Apareció un `else` "por las dudas" en un `when` sobre un sealed type?** Esto es lo primero a buscar y el error más frecuente: un `else -> {}` absorbe silenciosamente cualquier caso no contemplado, presente o futuro — elimina exactamente la garantía que sellar el tipo te da. Si la IA lo agregó, hay que sacarlo y dejar que el compilador marque error si falta un caso real.
+
+- **¿Se usó `enum class` donde en realidad cada caso necesita llevar datos distintos?** Si algún caso de la jerarquía necesita una propiedad que otro no tiene (`OnOrderClicked(val orderId: String)` vs. `OnRefresh` sin datos), un `enum` no puede modelar eso — todos sus valores tienen la misma forma. Es señal de que debería ser `sealed interface`/`sealed class`.
+
+- **¿`data object` se usó para los casos sin datos, en vez de `object` a secas o una `data class` vacía?** `data object` (Kotlin 1.9+) genera un `toString()` legible y comparación consistente, algo que un `object` simple no da tan cómodo y que una `data class` sin parámetros sería redundante. Si la IA usó `object` simple, no es un error grave, pero es la forma menos idiomática hoy.
+
+- **¿Se eligió `sealed class` cuando `sealed interface` alcanzaba, o viceversa?** Si ninguna subclase necesita estado/comportamiento común heredado, y no hace falta herencia múltiple, `sealed interface` es la opción por defecto — usar `sealed class` sin necesitarla es sobre-ingeniería menor, pero vale señalarlo. El caso inverso (necesitar una propiedad común tipo `timestamp` y modelarla repetida en cada subclase de una `sealed interface` en vez de usar `sealed class`) sí es una falta de aprovechar la herramienta correcta.
+
+- **¿Todas las subclases de la jerarquía están en el mismo paquete/módulo?** Sealed types requieren que todas las subclases sean conocidas en compile-time dentro del mismo módulo (con Kotlin moderno, mismo paquete alcanza dentro del módulo). Si la IA intentó extender una jerarquía sellada desde otro módulo o package sin que el proyecto lo permita, no va a compilar — y si el caso de uso real necesita que terceros externos extiendan la jerarquía libremente, sealed directamente no es la herramienta correcta.
