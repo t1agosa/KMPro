@@ -1,81 +1,65 @@
 # Espresso (UI Testing Instrumentado)
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Espresso es el framework oficial de Google para tests de UI **instrumentados** — tests que corren dentro de un dispositivo o emulador Android real, interactuando con la jerarquía de `View` de verdad, no simulada. Su API se organiza en tres piezas que se combinan siempre en el mismo orden: `ViewMatcher` (encontrar la vista — `withId()`, `withText()`), `ViewAction` (hacer algo — `click()`, `typeText()`) y `ViewAssertion` (verificar el resultado — `matches(isDisplayed())`), todo orquestado por el punto de entrada `onView(...)`. Nació para apps basadas en `View`/XML — con Compose, ese rol pasó en gran parte a la **Compose Testing Library** (`ComposeTestRule`), que opera sobre el árbol de semántica (ya documentado en `accesibilidad_a11y.md`) en vez de la jerarquía de `View`, con una filosofía casi idéntica pero una implementación completamente distinta y no intercambiable.
-
-## 2. El problema que resuelve
-
-Los tests unitarios de `UseCase`/`ViewModel` (documentados en `estrategia_y_prioridades.md` y `fakes_vs_mocks_turbine.md`) corren en la JVM, sin tocar un dispositivo real — verifican lógica, no que la UI efectivamente se vea o reaccione como se espera. Un test instrumentado como Espresso resuelve esa capa faltante: corre con el framework de Android real, verificando que un click de verdad dispare la acción esperada, que un texto aparezca en pantalla, que una transición ocurra. El problema específico que Espresso ataca dentro de esa categoría es la **sincronización**: sin ella, un test podría intentar aserción sobre una vista antes de que una animación o llamada asincrónica termine, dando resultados intermitentes (a veces pasa, a veces no) — Espresso espera automáticamente a que la cola de mensajes del hilo principal esté idle antes de ejecutar el siguiente paso, eliminando la mayoría de esos falsos negativos sin que el desarrollador tenga que agregar esperas manuales.
-
-## 3. Ejemplo mínimo comentado
-
-```kotlin
-// Test instrumentado clásico de Espresso, sobre una View XML (no Compose)
-@Test
-fun clickingSaveButton_showsConfirmationMessage() {
-    onView(withId(R.id.saveButton))
-        .perform(click())
-
-    onView(withId(R.id.confirmationText))
-        .check(matches(isDisplayed()))
-}
+```mermaid
+flowchart TD
+    A["Pantalla a testear"] --> B{"¿Tiene Views<br/>XML clásicas?"}
+    B -->|"Sí, o interop<br/>con SDK de terceros"| C["Espresso<br/>onView / perform / check"]
+    B -->|"No, 100% Compose"| D["Compose Testing<br/>onNode / performClick"]
+    C --> E["createAndroidComposeRule<br/>(puente entre ambos)"]
+    D --> E
+    E -->|"acción dispara<br/>coroutine en background"| F{"¿Hay IdlingResource<br/>registrado?"}
+    F -->|"No"| G["Test flaky<br/>🚩 falla al azar en CI"]
+    F -->|"Sí"| H["Espresso espera<br/>hasta que termine"]
 ```
 
+## 2. Qué es y cómo funciona
+
+Espresso es el framework oficial de Google para tests de UI **instrumentados** — tests que corren dentro de un dispositivo o emulador Android real, interactuando con la jerarquía de `View` de verdad, no simulada. Su API se organiza en tres piezas que se combinan siempre en el mismo orden, como muestra el diagrama: `ViewMatcher` (encontrar la vista — `withId()`, `withText()`), `ViewAction` (hacer algo — `click()`, `typeText()`) y `ViewAssertion` (verificar el resultado — `matches(isDisplayed())`), todo orquestado por el punto de entrada `onView(...)`.
+
+Nació para apps basadas en `View`/XML — con Compose, ese rol pasó en gran parte a la **Compose Testing Library** (`ComposeTestRule`), que opera sobre el árbol de semántica (ya documentado en `accesibilidad_a11y.md`) en vez de la jerarquía de `View`, con una filosofía casi idéntica (encontrar, actuar, verificar) pero una implementación completamente distinta y no intercambiable: Espresso no puede encontrar nodos de Compose, y Compose Testing no puede encontrar `View` clásicas.
+
+Los tests unitarios de `UseCase`/`ViewModel` corren en la JVM, sin tocar un dispositivo real — verifican lógica, no que la UI efectivamente se vea o reaccione como se espera. Un test instrumentado resuelve esa capa faltante, pero introduce un problema propio: la **sincronización**. Sin ella, un test podría hacer una aserción sobre una vista antes de que una animación o llamada asincrónica termine, dando resultados intermitentes. Espresso espera automáticamente a que la cola de mensajes del hilo principal esté idle antes de ejecutar el siguiente paso — pero, como muestra la rama derecha del diagrama, esa sincronización automática tiene un límite concreto que se detalla en la Sección 5.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de notas**, si la pantalla de edición es 100% Compose, el test de "escribir texto en el título y verificar que aparece en la lista" usa `ComposeTestRule` directo — no hace falta Espresso salvo que la app integre un editor de texto enriquecido de terceros que exponga una `View` nativa embebida en el árbol de Compose.
+
+En una **app de reservas de restaurantes**, si el mapa de ubicación del restaurante usa un SDK de mapas que expone su propia `View` (no un composable nativo), el test de esa pantalla necesita combinar ambos: `composeTestRule.onNode` para los elementos Compose de la pantalla (botón de confirmar, selector de fecha) y `onView` de Espresso para interactuar con el mapa embebido — el escenario exacto que resuelve `createAndroidComposeRule`.
+
+## 4. Implementación real
+
+**El PO pide:** "en la pantalla de historial de pedidos, cuando el usuario toca 'Actualizar', tiene que verse el spinner de carga y después la lista actualizada — necesitamos un test instrumentado que cubra ese flujo completo, porque es la pantalla más usada de la app."
+
 ```kotlin
-// Compose (lo que usa Timbax) — misma idea, pero sobre el árbol de semántica, no la View hierarchy
+// Compose Testing — la pantalla de OrdersScreen es 100% Compose
 @get:Rule
 val composeTestRule = createAndroidComposeRule<MainActivity>()
 
 @Test
-fun clickingSaveButton_showsConfirmationMessage() {
-    composeTestRule.onNodeWithText("Guardar").performClick()
-    composeTestRule.onNodeWithText("Puntaje guardado").assertIsDisplayed()
+fun tappingRefresh_showsLoadingThenUpdatedList() {
+    composeTestRule.onNodeWithContentDescription("Actualizar").performClick()
+
+    // el ViewModel dispara viewModelScope.launch { refreshOrders() } — ver caso trampa (Sección 5)
+    composeTestRule.onNodeWithTag("orders_loading_indicator").assertIsDisplayed()
+
+    composeTestRule.waitUntil(timeoutMillis = 5_000) {
+        composeTestRule.onAllNodesWithTag("orders_loading_indicator").fetchSemanticsNodes().isEmpty()
+    }
+
+    composeTestRule.onNodeWithText("Pedido #nuevo").assertIsDisplayed()
 }
 ```
 
-`onView`/`perform`/`check` (Espresso) y `onNode`/`performClick`/`assertIsDisplayed` (Compose Testing) siguen la misma filosofía de tres pasos — encontrar, actuar, verificar — pero son APIs completamente separadas que no se entienden entre sí por default: Espresso no puede encontrar nodos de Compose, y Compose Testing no puede encontrar `View` clásicas. `createAndroidComposeRule` es el puente que permite combinar ambas en la misma clase de test cuando hace falta (ver Matriz de criterio).
+Este test es exactamente el caso donde `estrategia_y_prioridades.md` recomienda moderación: es un flujo crítico de punta a punta (la pantalla más usada), así que justifica el costo de un test instrumentado — pero no reemplaza el test unitario de `RefreshOrdersUseCase` (JVM, milisegundos) ni el del `ViewModel` con Turbine, que siguen siendo la primera línea de defensa. `composeTestRule.waitUntil` acá cumple el mismo rol que un `IdlingResource` en Espresso puro: le da a Compose Testing una forma explícita de esperar el trabajo asincrónico antes de seguir.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-**Espresso vs. Compose Testing Library:**
-- Usar Compose Testing (`ComposeTestRule`) cuando: la pantalla es 100% Compose — es el caso general en un proyecto como Timbax. Corre más rápido que Espresso para tests aislados (no siempre necesita un emulador completo) y es menos propenso a flakiness porque su sincronización conoce directamente el ciclo de recomposición.
-- Usar Espresso cuando: el proyecto tiene `View` clásicas (XML) en algún punto de la app — legado, o interop de una librería de terceros que expone una `View` (un `WebView`, un SDK de mapas, un banner de ads) embebida dentro del árbol de Compose.
-- Trade-off: para un proyecto Compose-only, mantener Espresso sin necesidad real es carga extra de dependencias y conceptos sin beneficio — pero es exactamente la palabra clave que un reclutador de Android nativo espera ver, incluso si el uso real en el día a día es marginal.
+Si una IA generó un test instrumentado, revisar:
 
-**`createComposeRule()` vs. `createAndroidComposeRule<Activity>()`:**
-- Usar `createComposeRule()` cuando: el test es de un composable aislado, sin necesidad de una `Activity` real — más liviano, arranca una `ComponentActivity` vacía por detrás.
-- Usar `createAndroidComposeRule<MainActivity>()` cuando: el test necesita el contexto real de la `Activity` de la app (para interop con `View`, para acceder a algo que depende del `Application`/DI real) — es el que habilita combinar Espresso y Compose Testing en el mismo test.
-- Trade-off: `createAndroidComposeRule` es más pesado (levanta la `Activity` real de la app) pero es indispensable en cualquier escenario de interop.
-
-**Combinar Espresso + Compose Testing (interop) vs. usar solo uno de los dos:**
-- Combinar ambos cuando: la pantalla mezcla `View` clásicas y Compose en el mismo árbol — se matchean las `View` con `onView` (Espresso) y los elementos Compose con `composeTestRule.onNode` (Compose Testing), sin pasos especiales adicionales más allá de usar `createAndroidComposeRule`.
-- Usar solo uno cuando: la pantalla es enteramente de un solo tipo — mezclar frameworks sin necesidad real solo agrega complejidad al test sin beneficio.
-
-**Tests instrumentados (Espresso/Compose Testing) vs. tests unitarios de `ViewModel` con Turbine:**
-- Priorizar tests unitarios con Turbine (ya documentado en `fakes_vs_mocks_turbine.md`) cuando: lo que se quiere verificar es lógica de estado — corren en la JVM, sin emulador, en milisegundos, y son la prioridad real según `estrategia_y_prioridades.md`.
-- Reservar tests instrumentados para: los flujos críticos de punta a punta que sí necesitan verificarse contra el framework real de Android (un flujo de login completo, una compra) — son más lentos, más caros de mantener, y por eso se usan con moderación, no como reemplazo de los tests unitarios.
-
-## 5. Caso trampa
-
-Asumir que Espresso sincroniza automáticamente con **cualquier** trabajo asincrónico, incluidas coroutines lanzadas por la app:
-
-```kotlin
-// ❌ trampa: el ViewModel lanza una coroutine en background al guardar el puntaje,
-// pero el test no le avisa nada a Espresso sobre ese trabajo
-@Test
-fun savingScore_showsConfirmation() {
-    onView(withId(R.id.saveButton)).perform(click())
-    // acá el ViewModel dispara viewModelScope.launch { repository.savePlayer(...) }
-
-    onView(withId(R.id.confirmationText)).check(matches(isDisplayed())) // 🚩 flaky
-}
-```
-
-Espresso solo sincroniza automáticamente con trabajo que pasa por la cola de mensajes del hilo principal de Android (dibujo de `View`, el viejo `AsyncTask`). No tiene ninguna visibilidad sobre coroutines, streams de `Flow`, llamadas de red, o cualquier trabajo en threads/executors custom — desde su perspectiva, esas operaciones son invisibles. El test de arriba puede pasar la mayoría de las veces (si la coroutine termina rápido) y fallar intermitentemente cuando no (si el dispositivo está lento, si hay contención de CPU en CI) — el síntoma clásico de un test flaky, difícil de reproducir en la propia máquina y frustrante en CI. La corrección es un `IdlingResource` (típicamente `CountingIdlingResource`): se incrementa un contador cuando arranca el trabajo asincrónico relevante y se decrementa cuando termina, y Espresso espera mientras ese contador esté por encima de cero antes de seguir con el siguiente paso del test.
-
-La señal de alarma: cualquier test de Espresso que involucre una acción que dispara una `suspend fun`/coroutine (guardar en DB, llamar a la red) sin ningún `IdlingResource` registrado es candidato directo a flakiness — funciona en la demo, falla al azar en CI.
-
-## 6. Conexión con Timbax
-
-Timbax es 100% Compose, sin `View` XML — así que en el día a día, sus tests de UI (si se escriben, siguiendo la prioridad baja que ya documenta `estrategia_y_prioridades.md`: domain y presentation primero, UI casi nunca) usarían `ComposeTestRule` directamente, no Espresso puro. Espresso entra al mapa de Timbax en dos escenarios concretos: como la palabra clave que un reclutador de Android nativo espera ver en el CV (el motivo de fondo por el que este archivo existe en el repo), y como herramienta real si algún día Timbax embebiera una `View` nativa dentro de su árbol de Compose — por ejemplo, un `AdView` de un SDK de terceros, si el proyecto decidiera monetizar con ads (una decisión que hoy no está tomada, y que si se toma, debería documentarse en `14_criterio_y_decisiones` igual que las de los módulos 15-17). En ese escenario puntual, el patrón de `createAndroidComposeRule` combinando `onView` y `composeTestRule.onNode` en el mismo test es exactamente lo que haría falta.
+- **¿El test asume que Espresso (u `onView`) sincroniza automáticamente con una coroutine, un `Flow`, o una llamada de red disparada por el `ViewModel`?** Este es el caso trampa central: Espresso solo sincroniza con trabajo que pasa por la cola de mensajes del hilo principal de Android — no tiene visibilidad sobre coroutines ni streams de `Flow`. Un test así puede pasar la mayoría de las veces y fallar intermitentemente en CI, el síntoma clásico de un test flaky. La corrección es un `IdlingResource` (`CountingIdlingResource`) o, en Compose Testing, un `waitUntil` explícito como en el ejemplo — nunca asumir que "ya va a estar listo para cuando se ejecute la siguiente línea".
+- **¿Se eligió Espresso para una pantalla 100% Compose sin ninguna `View` clásica de por medio?** Si no hay interop real con `View`, usar `ComposeTestRule` directo — es más rápido y menos propenso a flakiness porque su sincronización conoce el ciclo de recomposición.
+- **¿Se usó `createAndroidComposeRule<Activity>()` cuando `createComposeRule()` alcanzaba?** `createAndroidComposeRule` levanta la `Activity` real de la app — es más pesado y solo se justifica cuando hace falta el contexto real (interop con `View`, DI real) o combinar Espresso con Compose Testing en el mismo test.
+- **¿Este test instrumentado duplica cobertura que ya existe (o debería existir) como test unitario más rápido?** Si lo que se está verificando es lógica de estado (loading → data → error), eso ya lo cubre — más barato y más rápido — un test de `ViewModel` con Turbine. Reservar los tests instrumentados para flujos de punta a punta que realmente necesitan verificarse contra el framework real.
+- **¿El test tiene un timeout razonable en su espera (`waitUntil`, `IdlingResource`), o puede quedar colgado indefinidamente si algo no llega a completarse?** Un test sin timeout que espera un estado que nunca llega no falla rápido — cuelga el pipeline de CI hasta que algo externo lo mate.

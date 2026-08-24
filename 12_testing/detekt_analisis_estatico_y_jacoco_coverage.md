@@ -1,19 +1,36 @@
 # Detekt + JaCoCo (Análisis Estático y Coverage)
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Dos herramientas que automatizan dos preguntas distintas sobre la calidad del código, ninguna de las cuales depende de correr tests:
+```mermaid
+flowchart TD
+    A["Detekt<br/>lee el código, sin ejecutarlo"] --> C["baseline.xml<br/>congela deuda existente"]
+    B["JaCoCo<br/>mide tras correr los tests"] --> D["Reporte XML/HTML<br/>% cobertura real"]
+    C --> E["Gate en CI<br/>bloquea el PR si falla"]
+    D --> E
+    E --> F["Merge a main"]
+```
+
+## 2. Qué es y cómo funciona
+
+Detekt y JaCoCo automatizan dos preguntas distintas sobre la calidad del código, ninguna de las cuales depende de la otra:
 
 - **Detekt**: analizador estático para Kotlin. Lee el código fuente (sin ejecutarlo) y reporta *code smells* — funciones demasiado largas, complejidad ciclomática alta, nombres poco claros, imports sin usar — según un set de reglas configurables (`detekt.yml`). Puede además envolver `ktlint` (vía el módulo `detekt-formatting`) para chequear estilo/formato en la misma pasada.
-- **JaCoCo**: herramienta de *code coverage*. A diferencia de Detekt, sí necesita que los tests corran — instrumenta el bytecode para registrar qué líneas/branches se ejecutaron durante la suite de tests, y produce un reporte con el porcentaje real de código cubierto.
+- **JaCoCo**: herramienta de *code coverage*. A diferencia de Detekt, sí necesita que los tests corran — instrumenta el bytecode para registrar qué líneas/branches se ejecutaron durante la suite, y produce un reporte con el porcentaje real de código cubierto.
 
-Detekt pregunta "¿este código está bien escrito?" sin correrlo jamás. JaCoCo pregunta "¿mis tests realmente tocan este código?" y solo puede responder después de ejecutarlos.
+Como muestra el diagrama, Detekt pregunta "¿este código está bien escrito?" sin correrlo jamás. JaCoCo pregunta "¿mis tests realmente tocan este código?" y solo puede responder después de ejecutarlos. Ambos alimentan el mismo gate en CI antes de un merge.
 
-## 2. El problema que resuelve
+Sin Detekt, los *code smells* se atrapan únicamente en code review humano — algo inconsistente, que depende de quién revisa ese día. Sin JaCoCo, "tenemos tests" es una afirmación sin evidencia objetiva: no hay forma de distinguir entre una suite que ejerce el 80% de la lógica de negocio y una con 3 tests que siempre pasan por el mismo camino feliz. Ambas herramientas automatizan un gate de calidad que de otra forma dependería enteramente del criterio (y el tiempo disponible) de quien revisa el Pull Request.
 
-Sin Detekt, los *code smells* (funciones gigantes, complejidad innecesaria, convenciones de nombres inconsistentes) se atrapan únicamente en code review humano — algo inconsistente, que depende de quién revisa ese día, y que no escala a medida que el equipo crece. Sin JaCoCo, "tenemos tests" es una afirmación sin evidencia objetiva: no hay forma de distinguir entre una suite que realmente ejerce el 80% de la lógica de negocio y una con 3 tests que siempre pasan por el mismo camino feliz, dejando ramas de error completamente sin cubrir. Ambas herramientas automatizan un gate de calidad que de otra forma dependería enteramente del criterio (y el tiempo disponible) de quien revisa el Pull Request.
+## 3. Cómo se ve en distintos contextos
 
-## 3. Ejemplo mínimo comentado
+En una **app de fitness**, una regla de Detekt de complejidad ciclomática alta señalaría si el cálculo de plan de entrenamiento personalizado (con ajustes por objetivo, nivel, y restricciones físicas) creciera hasta un punto donde un solo `UseCase` se vuelve difícil de leer — una señal objetiva de que esa lógica merece descomponerse.
+
+En una **app de e-commerce**, JaCoCo aplica con matiz distinto en el módulo de checkout: el domain (cálculo de totales, aplicación de descuentos) es donde el equipo prioriza testear primero, así que ahí el número de cobertura es confiable y accionable. En el módulo de UI del checkout, en cambio, un número bajo de cobertura no necesariamente representa un problema — es la capa donde, según `estrategia_y_prioridades.md`, casi no se invierte en tests automatizados.
+
+## 4. Implementación real
+
+**El PO pide:** "quiero que el equipo no pueda mergear código con complejidad excesiva sin darse cuenta, y necesito un número confiable de cuánto domain está realmente cubierto por tests."
 
 ```kotlin
 // build.gradle.kts — Detekt
@@ -35,42 +52,29 @@ apply(plugin = "jacoco")
 tasks.register<JacocoReport>("jacocoTestReport") {
     dependsOn("testDebugUnitTest") // corre primero los tests, JaCoCo mide sobre esa ejecución
     reports {
-        xml.required.set(true)  // formato que consumen herramientas de CI (SonarQube, etc.)
+        xml.required.set(true)  // formato que consumen herramientas de CI
         html.required.set(true) // formato navegable para revisar a mano
     }
 }
 ```
 
-`baseline.xml` es la pieza clave para adoptar Detekt en un proyecto que ya tiene código: en vez de forzar arreglar cientos de *findings* existentes de una sola vez, el baseline los "congela" como conocidos, y Detekt solo falla el build ante *código nuevo* que viole las reglas — la deuda vieja queda documentada, no bloqueando.
+`baseline.xml` es la pieza clave para adoptar Detekt en un proyecto que ya tiene código: en vez de forzar arreglar cientos de *findings* existentes de una sola vez, el baseline los "congela" como conocidos, y Detekt solo falla el build ante *código nuevo* que viole las reglas. En este proyecto, ese gate aplica directo sobre el domain (`RefreshOrdersUseCase`, mappers de `03_data`): si mañana ese `UseCase` crece con más ramas de manejo de error, Detekt marca la complejidad antes de que llegue a code review humano — y JaCoCo confirma, con el reporte HTML, si los tests nuevos realmente ejercitaron esas ramas o solo el camino feliz de siempre.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes — checklist de auditoría de código de IA
 
-**Detekt local (IDE/pre-commit) vs. en CI:**
-- Correrlo en el IDE/pre-commit cuando: querés feedback inmediato mientras escribís código, antes de siquiera abrir el PR — reduce la fricción de descubrir violaciones recién en CI, minutos después.
-- Correrlo en CI (bloqueante) cuando: es la garantía real de que nada con violaciones nuevas llega a `main` — el pre-commit es una ayuda, pero nunca reemplaza el gate obligatorio en el pipeline, porque es fácil saltearse un hook local.
-- Trade-off: ninguno real — ambos deberían coexistir, no es una decisión de "uno u otro".
+Si una IA configuró o modificó la integración de Detekt/JaCoCo, revisar:
 
-**`baseline.xml` vs. arreglar todo antes de habilitar Detekt:**
-- Usar `baseline` cuando: el proyecto ya tiene una cantidad significativa de código y arreglar todos los *findings* de una sentada no es viable — permite adoptar la herramienta ya, sin bloquear el resto del equipo por semanas.
-- Arreglar todo de entrada cuando: el proyecto es nuevo o chico — no vale la pena introducir un baseline si el volumen de *findings* iniciales es manejable en una tarde.
-- Trade-off: el baseline es pragmático pero puede convertirse en una alfombra debajo de la cual esconder deuda indefinidamente si nadie revisita el archivo — conviene tratarlo como una lista a reducir con el tiempo, no como permanente.
+- **¿Detekt corre solo en el IDE/pre-commit, sin ser bloqueante en CI?** El pre-commit es una ayuda, no un gate — es fácil saltearse un hook local. La garantía real de que nada con violaciones nuevas llega a `main` es el paso bloqueante en el pipeline de CI.
+- **¿Se está usando `baseline.xml` como excusa permanente en vez de una lista a reducir con el tiempo?** El baseline es pragmático para adoptar la herramienta sin bloquear al equipo, pero si nadie lo revisita, se convierte en una alfombra debajo de la cual esconder deuda indefinidamente.
+- **¿Un gate de cobertura mínima (`no bajar de X%`) se introdujo en un proyecto que recién está adoptando cultura de testing?** Un gate estricto desde el día uno incentiva tests superficiales que solo "tocan la línea" para subir el número, sin verificar nada real — la cobertura debería ser informativa primero, gate obligatorio después, cuando ya hay disciplina establecida.
+- **¿El porcentaje de cobertura reportado por JaCoCo sobre funciones `inline` se está tomando como verdad absoluta sin correlacionarlo con los tests que realmente existen?** Ver Sección 6 — es la trampa más específica de esta herramienta y la más fácil de malinterpretar en una auditoría rápida.
+- **¿Se agregó `detekt-formatting` duplicando una responsabilidad que ya cubre otra herramienta de formato del proyecto (el formatter nativo de Android Studio, un `ktlint` corriendo independiente)?** Mantener dos herramientas para el mismo aspecto es mantenimiento redundante sin beneficio real.
 
-**Cobertura de JaCoCo como gate obligatorio (ej: "no bajar de X%") vs. como métrica informativa:**
-- Usar como gate obligatorio cuando: el equipo ya tiene disciplina de testing establecida y el número sirve para prevenir regresiones de cobertura, no para perseguir un número alto por sí mismo.
-- Usar como métrica informativa (sin bloquear el build) cuando: el proyecto está introduciendo cultura de testing recién — un gate estricto desde el día uno incentiva tests superficiales que solo "tocan la línea" para subir el número, sin verificar nada real.
-- Trade-off: un gate de cobertura mal calibrado es peor que no tenerlo — un equipo bajo presión de un número puede escribir tests vacíos de valor solo para pasar el gate, lo que en la práctica reduce la calidad real de la suite mientras el dashboard muestra "mejora".
+## 6. Profundización: JaCoCo y funciones inline
 
-**Detekt solo vs. Detekt + `detekt-formatting` (wrapper de ktlint):**
-- Sumar `detekt-formatting` cuando: además de code smells, querés que la misma herramienta chequee estilo/formato (indentación, espacios, orden de imports) — evita mantener dos herramientas separadas para dos aspectos relacionados.
-- Mantener Detekt solo cuando: el formato ya se resuelve con otra herramienta (el formatter nativo de Android Studio, o `ktlint` corriendo independiente) — no hay necesidad real de duplicar esa responsabilidad.
+El caso trampa de la Sección 5 merece el mecanismo completo, porque "0% de cobertura" en un caso así es fácil de leer como "no está testeado" cuando en realidad es una limitación de medición.
 
-**Detekt/JaCoCo standalone vs. integrados en SonarQube:**
-- Usar Detekt + JaCoCo standalone (solo en CI, sin SonarQube) cuando: el proyecto es chico o personal (como Timbax) — los reportes de cada herramienta alcanzan por sí solos, y sumar un servidor de SonarQube sería complejidad sin beneficio real a esa escala.
-- Integrar ambos en SonarQube cuando: hay varios proyectos/módulos y un equipo que necesita una vista centralizada — SonarQube no reemplaza a Detekt ni a JaCoCo, los **consume**: tiene su propio analizador de Kotlin (bugs, vulnerabilidades, code smells) y además soporta oficialmente importar el reporte XML de Detekt (`sonar.kotlin.detekt.reportPaths`) y el de JaCoCo, mostrando todo junto en un solo dashboard con historial y Quality Gates configurables (ej: "cobertura de código nuevo no puede bajar de X%").
-- Trade-off: SonarQube agrega una pieza de infraestructura más para mantener (servidor propio o SonarCloud), a cambio de una vista consolidada y tendencias en el tiempo que ni Detekt ni JaCoCo dan por separado.
-## 5. Caso trampa
-
-Confiar ciegamente en el porcentaje que reporta JaCoCo para funciones que usan `inline`, sin entender que Kotlin y JaCoCo tuvieron (y en casos puntuales siguen teniendo) fricción real midiendo ese caso:
+**Qué hace el compilador con `inline`:**
 
 ```kotlin
 // commonMain — una función inline, como cualquier scope function de Kotlin
@@ -78,18 +82,22 @@ inline fun <T> T.applyIfValid(condition: Boolean, block: T.() -> Unit): T {
     if (condition) block()
     return this
 }
+```
 
-// test que SÍ ejercita la función
+Cuando el compilador de Kotlin encuentra una llamada a una función `inline`, no genera una llamada real a esa función en el bytecode — copia el cuerpo de la función directamente en el lugar donde se la invoca (el *call site*). Si `applyIfValid` se llama en 5 lugares distintos del código, el bytecode final tiene 5 copias del cuerpo de esa función, cada una fundida dentro del método que la llamó — no una función separada que JaCoCo pueda instrumentar como una unidad independiente.
+
+**Por qué esto rompe la medición de JaCoCo:** JaCoCo instrumenta el bytecode para saber qué líneas se ejecutaron, asociando cada bloque de bytecode instrumentado con una línea del código fuente original. Cuando el compilador inlinea una función, el bytecode resultante ya no tiene una correspondencia limpia de "esta línea de bytecode pertenece a esta línea del archivo `.kt` de la función" — quedó mezclado con el bytecode del call site. Durante años, esto llevó a que JaCoCo reportara funciones `inline` como 0% cubiertas incluso cuando el test las ejecutaba de verdad:
+
+```kotlin
+// test que SÍ ejercita la función, pero JaCoCo históricamente podía reportarla en 0%
 @Test
 fun `applyIfValid ejecuta el block cuando condition es true`() {
-    val result = Player(id = "1", name = "Tiago", score = 0)
+    val result = Order(id = "1", items = emptyList(), total = 0.0)
         .applyIfValid(condition = true) { /* ... */ }
     // el test pasa, la función se ejecutó de verdad
 }
 ```
 
-Durante años, JaCoCo reportó funciones `inline` de Kotlin como 0% cubiertas incluso cuando estaban efectivamente testeadas — porque el compilador de Kotlin, al inlinear la función en cada call site, deja el bytecode en una forma que JaCoCo no siempre asocia correctamente con la línea original. Versiones recientes de JaCoCo (0.8.13, 2025) mejoraron esto explícitamente — agregando cálculo de cobertura para funciones `inline`, incluidas las que tienen parámetros `reified`, y filtrando bytecode generado por el compiler plugin de Compose para no ensuciar el número — pero a la fecha siguen reportándose casos puntuales donde el número sale inflado o directamente en cero según dónde vive el call site. La trampa concreta: ver "0% de cobertura" en una función `inline` (las scope functions `let`/`apply`/`run`/`also`, documentadas en `scope_functions.md`, son inline por definición, y Compose usa `inline` extensivamente en su propio DSL) y asumir que significa "no está testeada", cuando puede ser una limitación de medición, no un hueco real de testing. La verificación correcta no es confiar en el número aislado — es correlacionarlo con la lista real de tests que existen para esa función antes de decidir que falta cobertura.
+**Estado actual:** versiones recientes de JaCoCo (0.8.13, 2025) mejoraron esto explícitamente — agregando cálculo de cobertura para funciones `inline`, incluidas las que tienen parámetros `reified`, y filtrando bytecode generado por el compiler plugin de Compose para no ensuciar el número. Pero a la fecha siguen reportándose casos puntuales donde el número sale inflado o directamente en cero según dónde vive el call site.
 
-## 6. Conexión con Timbax
-
-Detekt encaja de forma directa en el domain de Timbax: una regla como complejidad ciclomática alta señalaría, por ejemplo, si el cálculo de puntaje de una ronda de Chinchón (con sus reglas de bonificación, corte, y penalizaciones) creciera hasta un punto donde un solo `UseCase` se vuelve difícil de leer — una señal objetiva de que esa lógica merece descomponerse, en vez de esperar a que alguien lo note en code review. JaCoCo, en cambio, aplica con más matiz: el domain de Timbax (`UseCase`s, mappers) es justamente donde el patrón de este repo prioriza testear primero (`estrategia_y_prioridades.md`), y ahí la mayoría del código no es `inline`, así que el número de JaCoCo es confiable sin mayor cuidado. Donde el caso trampa de este archivo sí aplicaría es en el código de Compose UI — que en Timbax, siguiendo la misma estrategia de prioridades, casi no se testea con tests automatizados de todos modos, así que en la práctica la limitación de JaCoCo con código `inline` termina siendo más una curiosidad a conocer para una entrevista que un problema real del día a día del proyecto.
+**La verificación correcta:** no confiar en el número aislado — correlacionarlo con la lista real de tests que existen para esa función antes de decidir que falta cobertura. Las scope functions (`let`/`apply`/`run`/`also`, ver `scope_functions.md`) son inline por definición, y Compose usa `inline` extensivamente en su propio DSL — así que este caso aparece más seguido de lo que parece a primera vista.
