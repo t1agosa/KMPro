@@ -1,73 +1,104 @@
 # Logging estructurado en producción
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Logging estructurado es registrar eventos de la app como datos con forma (nivel de severidad, mensaje, tags, pares clave-valor de contexto), no como strings sueltos concatenados a mano. En KMP el estándar de facto es **Kermit** (Touchlab): expone una API común de logging en `commonMain` que en runtime escribe a distintos **outputs por plataforma** (Logcat en Android, `os_log`/NSLog en iOS, consola en Desktop/Web) a través de un sistema de **writers** (o *sinks*) configurables y componibles — podés tener varios writers activos a la vez, cada uno con su propio nivel mínimo de severidad.
+```mermaid
+flowchart TD
+    A["Código en cualquier capa<br/>logger.i / logger.e"] --> B["Logger (Kermit)<br/>commonMain"]
+    B --> C{"¿Severity >= minSeverity<br/>del writer?"}
+    C -->|"No"| D["Se descarta"]
+    C -->|"Sí"| E["platformLogWriter()<br/>Logcat / os_log / consola"]
+    C -->|"Sí, si Severity >= Warn"| F["CrashlyticsLogWriter<br/>kermit-crashlytics"]
+    F --> G["Firebase Crashlytics<br/>nativo (Android + iOS)"]
+```
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
+
+Logging estructurado es registrar eventos de la app como **datos con forma** — nivel de severidad, mensaje, tags, pares clave-valor de contexto — en vez de strings sueltos concatenados a mano. En KMP el estándar de facto es **Kermit** (Touchlab): expone una API común de logging en `commonMain` que en runtime escribe a distintos **outputs por plataforma** a través de un sistema de **writers** (o *sinks*) configurables y componibles. Podés tener varios writers activos a la vez, cada uno con su propio nivel mínimo de severidad — eso es lo que te deja, por ejemplo, mandar todo a Logcat en local pero solo `Warn`+ a un backend de crash reporting en producción.
 
 `println()` o el logger nativo de cada plataforma por separado tiene tres problemas en producción:
 
 - **No es multiplataforma**: tenés que escribir y mantener lógica de logging distinta en cada `platformMain`.
-- **No es estructurado**: un string tipo `"Error guardando score: $e"` es difícil de filtrar, buscar o correlacionar cuando después vive mezclado con miles de líneas en un backend de crash reporting.
+- **No es estructurado**: un string tipo `"Error guardando pedido: $e"` es difícil de filtrar, buscar o correlacionar cuando después vive mezclado con miles de líneas en un backend de crash reporting.
 - **No distingue dev de producción**: sin un mecanismo de niveles y writers, terminás con logs de debug ensuciando producción, o directamente sin ningún log llegando a ningún lado cuando el usuario real tiene un problema que vos no podés reproducir.
 
-## 3. Ejemplo mínimo comentado
+Un writer remoto (Crashlytics, Sentry, Bugsnag) no reemplaza al writer local — corren en paralelo. El local sirve para debuggear en desarrollo; el remoto es la única ventana que tenés al comportamiento real en producción, donde no hay debugger conectado.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness**, el logging estructurado suele centrarse en el flujo de sincronización con el dispositivo wearable: un `logger.e` con el modelo del dispositivo y el tipo de sensor como contexto, disparado en el catch de la sincronización, es lo que permite distinguir en producción si un fallo de sync es específico de una marca de reloj o un problema general de conectividad — sin eso, todos los reportes de "no sincroniza" llegan indistinguibles entre sí.
+
+En una **app de e-commerce**, un caso típico es instrumentar el flujo de checkout: `logger.w` en cada paso que el usuario abandona sin completar el pago, con el método de pago intentado como tag. La diferencia con analytics (que también podría capturar esto) es el propósito — acá el log existe para debuggear un fallo técnico puntual (una excepción del SDK de pagos), no para medir comportamiento agregado de producto.
+
+## 4. Implementación real
+
+**Pedido del PO:** *"Cuando falla la sincronización de pedidos en producción, no tenemos forma de saber por qué — necesitamos que los errores reales lleguen a algún lado con el contexto mínimo para reproducirlos, sin inundar el backend con ruido de debug."*
 
 ```kotlin
-// commonMain — configuración base de Kermit
+// commonMain — configuración base del logger, expuesta vía Koin
 import co.touchlab.kermit.Logger
 import co.touchlab.kermit.Severity
 import co.touchlab.kermit.StaticConfig
 import co.touchlab.kermit.platformLogWriter
 
-val logger = Logger(
+fun provideLogger(remoteWriter: LogWriter): Logger = Logger(
     config = StaticConfig(
-        minSeverity = Severity.Debug, // en debug build, todo pasa
-        logWriterList = listOf(platformLogWriter()) // Logcat / os_log según plataforma
+        minSeverity = Severity.Debug, // en debug build, todo pasa por acá
+        logWriterList = listOf(
+            platformLogWriter(),       // siempre, para ver todo en local (Logcat/os_log)
+            remoteWriter                // solo Warn+, ver actual/androidMain más abajo
+        )
     ),
-    tag = "Timbax"
+    tag = "OrdersSync"
 )
-
-// uso en cualquier capa de commonMain
-logger.i { "Score guardado para player=${player.id}" }
-logger.e(throwable) { "Fallo al guardar score" }
 ```
 
 ```kotlin
-// androidMain — sumamos un writer de producción (Crashlytics vía GitLive)
-import co.touchlab.kermit.Severity
-
-val crashlyticsWriter = FirebaseCrashlyticsWriter(minSeverity = Severity.Warn)
-
-val productionLogger = Logger(
-    config = StaticConfig(
-        minSeverity = Severity.Debug,
-        logWriterList = listOf(platformLogWriter(), crashlyticsWriter)
-        // platformLogWriter: siempre, para ver todo en local
-        // crashlyticsWriter: solo Warn+ para no inundar el backend
-    )
-)
+// commonMain — uso real dentro de RefreshOrdersUseCase
+class RefreshOrdersUseCase(
+    private val repository: OrderRepository,
+    private val logger: Logger
+) {
+    suspend operator fun invoke(): Result<Unit> = try {
+        repository.refreshOrders()
+        Result.success(Unit)
+    } catch (e: CancellationException) {
+        throw e // nunca se loguea ni se atrapa una cancelación normal de coroutine
+    } catch (e: Exception) {
+        logger.e(e) {
+            "Fallo al refrescar pedidos"
+        }
+        Result.failure(e)
+    }
+}
 ```
 
-## 4. Matriz de criterio
+```kotlin
+// androidMain — writer remoto vía la extensión oficial kermit-crashlytics,
+// que habla directo con el SDK nativo de Firebase Crashlytics (sin wrapper de terceros)
+import co.touchlab.kermit.crashlytics.CrashlyticsLogWriter
+import co.touchlab.kermit.Severity
 
-| Escenario | Usar | NO usar | Trade-off |
-|---|---|---|---|
-| Debug local, cualquier capa | `logger.d` / `logger.v` con writer de consola | Enviar a Crashlytics | Ruido innecesario en el backend de producción |
-| Excepción real en producción | `logger.e(throwable) { }` con writer que reporta (Crashlytics/Sentry/Bugsnag) | Solo loguear localmente | Sin writer remoto, el error nunca llega a vos |
-| Contexto de negocio (playerId, gameId) | Pares clave-valor estructurados, no interpolación libre en el string | `"Error para $player"` sin estructura | El string libre no es filtrable ni agregable en el backend |
-| Multiplataforma (Android + iOS + Desktop) | Kermit (`platformLogWriter()` resuelve el output nativo por plataforma) | Lógica de logging duplicada en cada `platformMain` | Ninguno real — es la solución estándar KMP |
-| Nivel de severidad en release build | `minSeverity = Warn` o superior para writers remotos | Mandar `Debug`/`Verbose` a producción | Satura el backend y encarece el plan del proveedor |
+actual fun provideRemoteLogWriter(): LogWriter =
+    CrashlyticsLogWriter(minSeverity = Severity.Warn)
+```
 
-## 5. Caso trampa
+```swift
+// iosApp — equivalente nativo del lado Swift para reportes no capturados
+// por Kotlin/Native antes de llegar al runtime de iOS
+FirebaseApp.configure()
+Crashlytics.crashlytics().log("App inicializada")
+```
 
-**"Ya logueo la excepción con `logger.e(throwable)`, con eso alcanza para debuggear un crash reportado por un usuario en producción."**
+Con `minSeverity = Warn` en el writer remoto, un `logger.d`/`logger.i` de debug nunca llega a Crashlytics — solo `logger.w`/`logger.e` viajan, que es exactamente el ruido que el PO no quiere pagar.
 
-Falso si el log no viaja con contexto. Un `logger.e` sin datos asociados (qué pantalla, qué evento disparó la acción, qué estado tenía el ViewModel) te da el stack trace pero no el *por qué* — en local podés reproducir con el debugger, en producción no. La respuesta correcta es adjuntar contexto estructurado antes de que ocurra el error (custom keys en Crashlytics, breadcrumbs en Sentry) para que cuando el error explote, el reporte ya venga con la foto completa del estado, no solo el stack.
+## 5. Buenas prácticas y errores comunes
 
-Trampa relacionada, específica de iOS/Kotlin Native: un crash **fatal** en iOS termina generando **dos reportes separados** en el backend (uno del sistema, con `konan::abort()`, y uno no-fatal con el stack de Kotlin) — no es un bug de tu logging, es una limitación conocida de cómo Kotlin/Native propaga excepciones no capturadas hacia el runtime de iOS. Si ves duplicados, no asumas que tu writer está mal configurado.
+Checklist para auditar código de logging generado por una IA antes de aprobar el PR:
 
-## 6. Conexión con Timbax
-
-Timbax ya usa Firebase vía GitLive SDK — el camino natural es Kermit + un writer que reporte a Firebase Crashlytics (también vía GitLive) con `minSeverity = Warn`, dejando `platformLogWriter()` corriendo siempre en paralelo para debug local. Un buen primer punto de instrumentación real: envolver `SaveScoreUseCase` con `logger.e(throwable) { "..." }` en el catch, con el `playerId` y el `score` como contexto — así un fallo real de guardado en producción llega con los datos mínimos para reproducirlo, sin necesitar que el usuario te lo describa a mano.
+- **¿El log de una excepción real incluye contexto estructurado, no solo el stack trace?** `logger.e(throwable) { "Fallo" }` sin datos asociados (qué pantalla, qué operación, qué estado tenía el ViewModel) da el *qué* pero no el *por qué* — en producción no hay debugger para completar la historia. El contexto tiene que ir *en* el log, no reconstruirse después adivinando.
+- **¿El `minSeverity` del writer remoto es `Warn` o superior, nunca `Debug`/`Verbose`?** Mandar todo a un backend de crash reporting en release build satura el proveedor y encarece el plan sin agregar señal — el writer local (`platformLogWriter()`) ya cubre debug.
+- **¿La excepción se loguea antes o después de decidir si es una `CancellationException`?** Si el catch loguea primero y relanza después (o peor, no relanza), una cancelación normal de coroutine (el usuario navegó fuera de la pantalla) va a aparecer como un error real en el dashboard de producción. Ver `07_-_supervisorjob_excepciones.md` para el detalle de por qué `CancellationException` nunca se trata como una excepción de negocio.
+- **¿El writer remoto vive en el `platformMain` correcto, sin fugas de una dependencia que ya no aplica?** Verificar que el proyecto no arrastre un wrapper multiplatform de terceros para Crashlytics si el stack real usa el SDK nativo — la extensión oficial `kermit-crashlytics` habla directo contra Android/iOS sin esa capa intermedia.
+- **¿Un log con contexto sensible (email, nombre real, datos de pago) llegó a un writer remoto?** Los backends de crash reporting no son un destino apto para PII — el contexto estructurado tiene que limitarse a identificadores técnicos (IDs, tipos, estados), nunca a datos personales.
+- **Caso trampa a tener presente en iOS:** un crash **fatal** en iOS puede generar **dos reportes separados** en el backend (uno del sistema, uno no-fatal con el stack de Kotlin) — no es un bug de la configuración del writer, es una limitación conocida de cómo Kotlin/Native propaga excepciones no capturadas hacia el runtime de iOS.

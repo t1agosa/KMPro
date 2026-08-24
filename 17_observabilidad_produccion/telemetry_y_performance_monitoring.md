@@ -1,64 +1,115 @@
 # Telemetry y performance monitoring
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Performance monitoring es medir cuánto tarda tu app en hacer cosas concretas (arrancar, cargar una pantalla, responder a un tap, completar un request de red) y mandar esos números a un backend donde se agregan por versión de app, dispositivo, país, etc. — para detectar degradación de performance en producción antes de que se convierta en una mala review. Se instrumenta con **traces**: un trace tiene un punto de inicio, un punto de fin, y opcionalmente atributos (strings para filtrar) y métricas custom (números para graficar). A diferencia del logging (que registra eventos discretos), telemetry mide **duración** y **frecuencia** de procesos.
+```mermaid
+flowchart TD
+    A["Flujo de negocio<br/>ej. RefreshOrdersUseCase"] --> B["trace.start()<br/>expect PerformanceTrace"]
+    B --> C["Ejecuta el flujo instrumentado"]
+    C --> D{"¿Éxito o falla?"}
+    D -->|"Éxito"| E["trace.incrementMetric('success')"]
+    D -->|"Falla"| F["trace.incrementMetric('failure')"]
+    E --> G["trace.stop()<br/>finally, siempre"]
+    F --> G
+    G --> H["Firebase Performance<br/>nativo (Android + iOS)"]
+```
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Sin telemetry, "la app se siente lenta" es una queja sin datos: no sabés si es un dispositivo específico, una versión de Android vieja, un endpoint de red lento, o una query de base de datos que se degradó con más filas. Los out-of-the-box traces (arranque de app, requests HTTP) dan una primera foto automática, pero no cubren procesos específicos de tu dominio — eso requiere instrumentación manual, a propósito, en los puntos que vos identificás como críticos.
+Performance monitoring es medir cuánto tarda tu app en hacer cosas concretas (arrancar, cargar una pantalla, completar un flujo de negocio) y mandar esos números a un backend donde se agregan por versión de app, dispositivo, país, etc. — para detectar degradación de performance en producción antes de que se convierta en una mala review. Se instrumenta con **traces**: un trace tiene un punto de inicio, un punto de fin, y opcionalmente atributos (strings para filtrar) y métricas custom (números para graficar). A diferencia del logging (que registra eventos discretos), telemetry mide **duración** y **frecuencia** de procesos.
 
-## 3. Ejemplo mínimo comentado
+Firebase Performance Monitoring no tiene SDK oficial multiplatform — solo Android (Kotlin) e iOS (Swift/Obj-C) por separado. El patrón real en KMP es declarar una interfaz `expect` mínima en `commonMain` (`start()`, `stop()`, `putAttribute()`, `incrementMetric()`) e implementarla contra el SDK nativo de cada plataforma con `actual`, sin depender de un wrapper multiplatform de terceros.
+
+Los traces **out-of-the-box** (arranque de app, tiempo en foreground/background) dan una primera foto automática sin instrumentar nada. Pero no cubren procesos específicos de tu dominio — eso requiere un trace custom, a propósito, en los puntos que vos identificás como críticos. Importante: el tracking automático de requests de red del SDK solo reconoce las librerías HTTP estándar de cada plataforma (`OkHttp` en Android, `NSURLSession` en iOS) — una fuente de datos que habla con el backend por un canal distinto (por ejemplo Firestore, que usa gRPC internamente) no aparece ahí solo por tener el SDK instalado.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness**, un trace custom típico envuelve el flujo completo de sincronización con el wearable — desde que arranca la conexión Bluetooth hasta que los datos del último entrenamiento quedan persistidos localmente. El atributo más útil ahí suele ser el modelo del dispositivo, para poder filtrar en el dashboard si la lentitud es específica de una marca de reloj.
+
+En una **app de e-commerce**, el candidato natural es el flujo de checkout completo: desde que el usuario confirma la compra hasta que el backend confirma el cobro. Ahí `incrementMetric()` sirve para contar reintentos de pago dentro del mismo trace — un dato que un log individual por reintento no permite agregar ni graficar en el dashboard de la misma forma.
+
+## 4. Implementación real
+
+**Pedido del PO:** *"Algunos usuarios reportan que sincronizar sus pedidos tarda mucho, pero no sabemos si es un problema general o algo puntual de ciertos dispositivos — necesitamos datos, no intuición."*
 
 ```kotlin
-// commonMain — trace custom sobre el flujo de guardado de partida
-import dev.gitlive.firebase.Firebase
-import dev.gitlive.firebase.perf.performance
+// commonMain — contrato mínimo, sin depender de ningún SDK concreto
+interface PerformanceTrace {
+    fun start()
+    fun stop()
+    fun putAttribute(key: String, value: String)
+    fun incrementMetric(name: String, by: Long = 1)
+}
 
-suspend fun saveGameWithTrace(players: List<Player>) {
-    val trace = Firebase.performance.newTrace("save_game_flow")
-    trace.start()
-    trace.putAttribute("player_count", players.size.toString())
+expect fun newTrace(name: String): PerformanceTrace
+```
 
-    try {
-        saveGameUseCase(players)
-        trace.incrementMetric("success")
-    } catch (e: Exception) {
-        trace.incrementMetric("failure")
-        throw e
-    } finally {
-        trace.stop() // siempre se cierra, haya fallado o no
+```kotlin
+// commonMain — uso real dentro de RefreshOrdersUseCase
+class RefreshOrdersUseCase(
+    private val repository: OrderRepository
+) {
+    suspend operator fun invoke(): Result<Unit> {
+        val trace = newTrace("refresh_orders_flow")
+        trace.start()
+        return try {
+            repository.refreshOrders()
+            trace.incrementMetric("success")
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            trace.incrementMetric("failure")
+            Result.failure(e)
+        } finally {
+            trace.stop() // siempre se cierra, haya fallado o no — ver checklist
+        }
     }
 }
 ```
 
 ```kotlin
-// medición de un request HTTP puntual (fuera del tracking automático de Ktor)
-val metric = Firebase.performance.newHttpMetric("https://api.timbax.com/sync", "POST")
-metric.start()
-val response = httpClient.post("https://api.timbax.com/sync") { /* ... */ }
-metric.setHttpResponseCode(response.status.value)
-metric.stop()
+// androidMain — actual contra el SDK nativo de Firebase Performance
+import com.google.firebase.perf.FirebasePerformance
+import com.google.firebase.perf.metrics.Trace
+
+actual fun newTrace(name: String): PerformanceTrace =
+    AndroidPerformanceTrace(FirebasePerformance.getInstance().newTrace(name))
+
+class AndroidPerformanceTrace(private val trace: Trace) : PerformanceTrace {
+    override fun start() = trace.start()
+    override fun stop() = trace.stop()
+    override fun putAttribute(key: String, value: String) = trace.putAttribute(key, value)
+    override fun incrementMetric(name: String, by: Long) = trace.incrementMetric(name, by)
+}
 ```
 
-## 4. Matriz de criterio
+```kotlin
+// iosMain — actual contra el SDK nativo de Firebase Performance para iOS
+// (vía cinterop, con el pod FirebasePerformance ya configurado en el proyecto)
+import cocoapods.FirebasePerformance.FIRPerformance
+import cocoapods.FirebasePerformance.FIRTrace
 
-| Escenario | Usar | NO usar | Trade-off |
-|---|---|---|---|
-| Flujo de negocio crítico (guardar partida, sincronizar) | Trace custom con `start()`/`stop()` alrededor del flujo completo | Confiar solo en los traces automáticos | Los automáticos no conocen tu dominio, solo miden lo genérico (arranque, red) |
-| Filtrar performance por condición (ej: modo offline, feature flag) | `putAttribute()` en el trace | Crear un trace distinto por cada variante | Attributes filtran en el dashboard sin explotar la cantidad de traces distintos a mantener |
-| Contar ocurrencias dentro de un trace (cache hits, reintentos) | `incrementMetric()` | Loguear cada ocurrencia por separado con Kermit | Metric se agrega y grafica en el dashboard; un log individual no |
-| Medición de latencia de un solo evento puntual y aislado | Trace simple sin mucho aparato | Instrumentar todo el codebase con traces | Sobre-instrumentar agrega overhead de mantenimiento sin ganancia — no todo necesita medirse |
-| Detectar network requests lentos | `newHttpMetric` o el tracking automático del SDK | Medir tiempo de red "a mano" con timestamps propios | El SDK ya normaliza y agrega esos datos en el dashboard con contexto de dispositivo/versión |
+actual fun newTrace(name: String): PerformanceTrace =
+    IosPerformanceTrace(FIRPerformance.sharedInstance().traceWithName(name)!!)
 
-## 5. Caso trampa
+class IosPerformanceTrace(private val trace: FIRTrace) : PerformanceTrace {
+    override fun start() = trace.start()
+    override fun stop() = trace.stop()
+    override fun putAttribute(key: String, value: String) = trace.setValue(value, forAttribute = key)
+    override fun incrementMetric(name: String, by: Long) = trace.incrementMetric(name, byInt = by)
+}
+```
 
-**"Instrumenté un trace en `saveGameWithTrace()` y no veo nada en el dashboard de Firebase, algo está roto."**
+Con este trace instrumentado, si en producción aparece que refrescar pedidos tarda de más en un segmento de dispositivos, el dato sale del dashboard de Firebase filtrado por atributos — no de una sospecha sin evidencia.
 
-No necesariamente — Firebase Performance Monitoring tiene una demora real de agregación de datos (puede tardar minutos, a veces bastante más, en aparecer en la consola), especialmente en builds de debug donde el pipeline de recolección es menos prioritario. Antes de asumir que la instrumentación está mal, hay que dar tiempo y, si es posible, verificar con una build de release o con el modo de debug logging del SDK de Performance, no solo mirando el dashboard en caliente.
+## 5. Buenas prácticas y errores comunes
 
-Trampa relacionada: un trace que arranca con `start()` pero cuyo `stop()` vive solo en el camino feliz (sin `finally` o equivalente) queda "colgado" si el proceso lanza una excepción antes de llegar al `stop()` — el trace nunca se cierra, no aparece con datos útiles, y en el peor caso podés terminar con falsos negativos (parece que el flujo nunca se ejecuta cuando en realidad está fallando silenciosamente antes de tiempo).
+Checklist para auditar código de telemetry generado por una IA antes de aprobar el PR:
 
-## 6. Conexión con Timbax
-
-Timbax ya trae Firebase vía GitLive, y el SDK expone `firebase-perf` con la misma API mostrada arriba (`Firebase.performance.newTrace`), sin necesitar código `expect/actual` adicional. El candidato más directo para el primer trace real: envolver el flujo completo de `SaveScoreUseCase` (desde que el usuario confirma hasta que el repository confirma el guardado en SQLDelight/Firestore), con `player_count` como atributo — así, si en producción aparece que guardar tarda de más para partidas con muchos jugadores, el dato sale del dashboard en vez de una sospecha sin evidencia.
+- **¿El `stop()` está garantizado en un `finally` (o equivalente), no solo en el camino feliz?** Un trace que arranca con `start()` pero cuyo `stop()` vive solo si la operación tiene éxito queda "colgado" si el flujo lanza una excepción antes de llegar ahí — nunca se cierra, no aparece con datos útiles, y en el peor caso genera falsos negativos.
+- **¿Se instrumentó un flujo de negocio real, o se está sobre-instrumentando todo el codebase?** No todo necesita medirse — sobre-instrumentar agrega overhead de mantenimiento sin ganancia real.
+- **¿Se usaron `putAttribute()` para variantes del mismo flujo, en vez de crear un trace distinto por cada una?** Los atributos filtran en el dashboard sin explotar la cantidad de traces distintos a mantener.
+- **¿El código asume que ver (o no ver) el dato en el dashboard de inmediato significa que la instrumentación funciona (o está rota)?** Firebase Performance Monitoring tiene una demora real de agregación, especialmente en builds de debug.
+- **¿Se asumió que el tracking automático de red cubre una fuente de datos que en realidad no pasa por HTTP estándar?** Si el repositorio habla con Firestore (gRPC) en vez de un cliente HTTP reconocido por el SDK, esa parte del flujo no aparece en los traces de red automáticos.
+- **¿El `expect`/`actual` de `PerformanceTrace` está implementado en ambas plataformas, o solo en Android?** Verificar que `iosMain` tenga la implementación real, no un no-op.
