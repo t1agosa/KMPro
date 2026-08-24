@@ -1,22 +1,57 @@
 # Convention plugins
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Plugins Gradle custom (típicamente ubicados en un módulo `build-logic` o `buildSrc`) que centralizan configuración repetida entre módulos: sourceSets, targets (Android/iOS/Desktop), versiones de Compose, dependencias comunes. En vez de que cada `build.gradle.kts` de cada feature reescriba 40 líneas de configuración de targets, aplica un solo plugin propio (`id("convention.kmp-feature")`) que ya trae todo eso resuelto.
+```mermaid
+flowchart TB
+    A["build-logic/ (proyecto Gradle propio)"] --> B["convention.kmp-feature.gradle.kts<br/>(el plugin)"]
+    
+    B --> C[targets: Android/iOS]
+    B --> D[config: Compose Multiplatform]
+    B --> E["dependencias base: :core:network, :core:design-system"]
+    
+    B -.se aplica en.-> F["feature/orders/build.gradle.kts<br/>id('convention.kmp-feature')"]
+    B -.se aplica en.-> G["feature/profile/build.gradle.kts<br/>id('convention.kmp-feature')"]
+    
+    F --> H["+ dependencias específicas<br/>de orders"]
+    G --> I["+ dependencias específicas<br/>de profile"]
+    
+    style B fill:#59d,color:#000
+    style F fill:#2d5,color:#000
+    style G fill:#2d5,color:#000
+```
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Modularizar (ver archivo anterior) trae un costo colateral: cada módulo nuevo necesita su propio `build.gradle.kts` con targets (`androidTarget()`, `iosX64()`, `iosArm64()`, `iosSimulatorArm64()`), configuración de Compose, y dependencias base. En un proyecto con 3-4 módulos, copiar y pegar esa configuración en cada uno es molesto pero tolerable. En un proyecto con 15-20 módulos (como el ejemplo bancario del archivo anterior), se vuelve un problema real:
+Plugins Gradle custom (típicamente ubicados en un módulo `build-logic` o `buildSrc`) que centralizan configuración repetida entre módulos: sourceSets, targets (Android/iOS/Desktop), versiones de Compose, dependencias comunes. En vez de que cada `build.gradle.kts` de cada feature reescriba la misma configuración de targets, aplica un solo plugin propio (`id("convention.kmp-feature")`) que ya trae todo eso resuelto.
 
-- **Duplicación masiva.** El mismo bloque de configuración de targets repetido en cada `build.gradle.kts` — si hay que agregar un target nuevo (por ejemplo, sumar soporte Wasm), hay que tocar 20 archivos uno por uno.
-- **Inconsistencia silenciosa.** Alguien crea un módulo nuevo copiando el `build.gradle.kts` de otro módulo más viejo, y arrastra configuración desactualizada o mal ajustada sin darse cuenta — no hay una única fuente de verdad de "así se configura un módulo feature en este proyecto".
-- **Fricción para crear módulos nuevos.** Si crear un módulo implica escribir 40 líneas de Gradle a mano, eso desalienta la modularización fina — la gente termina metiendo cosas de más en un módulo existente en vez de crear uno nuevo, justo lo contrario de lo que se buscaba en el archivo anterior.
+**El problema que resuelve:** modularizar (ver archivo anterior) trae un costo colateral. Cada módulo nuevo necesita su propio `build.gradle.kts` con targets (`androidTarget()`, `iosX64()`, `iosArm64()`, `iosSimulatorArm64()`), configuración de Compose, y dependencias base. En un proyecto con 3-4 módulos, copiar y pegar esa configuración en cada uno es molesto pero tolerable. En un proyecto con 15-20 módulos, se vuelve un problema real:
 
-## 3. Ejemplo mínimo comentado
+- **Duplicación masiva.** El mismo bloque de configuración de targets repetido en cada `build.gradle.kts` — si hay que agregar un target nuevo (por ejemplo, sumar soporte Wasm), hay que tocar todos los módulos uno por uno.
+- **Inconsistencia silenciosa.** Alguien crea un módulo nuevo copiando el `build.gradle.kts` de otro módulo más viejo, y arrastra configuración desactualizada sin darse cuenta — no hay una única fuente de verdad de "así se configura un módulo feature en este proyecto".
+- **Fricción para crear módulos nuevos.** Si crear un módulo implica escribir varias líneas de Gradle a mano, eso desalienta la modularización fina — la gente termina metiendo cosas de más en un módulo existente en vez de crear uno nuevo, justo lo contrario de lo que se buscaba en el archivo anterior.
+
+## 3. Cómo se ve en distintos contextos
+
+**App bancaria con 15-20 módulos:** acá los convention plugins dejan de ser un "nice to have" y se vuelven casi imprescindibles. Si mañana hay que actualizar la versión de Compose Multiplatform o sumar un target nuevo, la alternativa sin plugin es tocar 15-20 archivos `build.gradle.kts` a mano, con el riesgo real de que alguno quede desactualizado. Con el plugin, se cambia en un solo lugar (`build-logic`) y todos los módulos que lo aplican quedan alineados automáticamente. Además, con varios equipos creando módulos en paralelo, el plugin fuerza una configuración consistente en vez de que cada dev configure su módulo "a su manera".
+
+**Proyecto con 2-3 módulos:** acá el costo de mantener un `build-logic` propio —que es, en sí mismo, otro proyecto Gradle con su propia curva de setup— no se paga con tan poca duplicación. Copiar y pegar la configuración de targets en 2-3 archivos es tolerable, y crear un plugin custom para tan pocos módulos es indirección sin beneficio real todavía.
+
+## 4. Implementación real
+
+**Contexto:** el proyecto ya tiene `:feature:orders` y `:feature:profile` (del archivo anterior), y el PO pide sumar una tercera feature. El equipo nota que está copiando la misma configuración de targets y dependencias base en cada `build.gradle.kts` nuevo, y pide centralizarla.
+
+```kotlin
+// build-logic/build.gradle.kts — declara que build-logic es, en sí,
+// un proyecto Gradle que compila plugins (no una app)
+plugins {
+    `kotlin-dsl`
+}
+```
 
 ```kotlin
 // build-logic/src/main/kotlin/convention.kmp-feature.gradle.kts
-// Este archivo ES el plugin — su nombre de archivo define el id del plugin
+// este archivo ES el plugin — su nombre de archivo define el id del plugin
 plugins {
     id("org.jetbrains.kotlin.multiplatform")
     id("org.jetbrains.compose")
@@ -38,15 +73,7 @@ kotlin {
 ```
 
 ```kotlin
-// build-logic/build.gradle.kts — declara que build-logic es, en sí,
-// un proyecto Gradle que compila plugins (no una app)
-plugins {
-    `kotlin-dsl`
-}
-```
-
-```kotlin
-// feature/players/build.gradle.kts — así de simple queda cada módulo
+// feature/orders/build.gradle.kts — así de simple queda cada módulo
 // toda la configuración de targets/Compose/dependencias base ya viene del plugin
 plugins {
     id("convention.kmp-feature")
@@ -62,25 +89,29 @@ kotlin {
 }
 ```
 
-## 4. Matriz de criterio
+```kotlin
+// feature/profile/build.gradle.kts — misma base, sin repetir targets/Compose
+plugins {
+    id("convention.kmp-feature")
+}
 
-**Usar convention plugins cuando:**
-- Ya tenés 4-5+ módulos con configuración de targets/Compose repetida — el punto de quiebre suele ser cuando cambiar algo de esa config a mano implica tocar más de 2-3 archivos.
-- Vas a seguir creando módulos nuevos con cierta frecuencia (proyecto en crecimiento activo, no uno ya cerrado).
-- Hay más de una persona creando módulos — la consistencia forzada por el plugin evita que cada dev configure su módulo "a su manera".
+kotlin {
+    sourceSets {
+        commonMain.dependencies {
+            implementation(project(":core:database"))
+        }
+    }
+}
+```
 
-**NO usar (todavía) cuando:**
-- Tenés 1-3 módulos — el costo de mantener un `build-logic` propio (otro proyecto Gradle dentro del proyecto, con su propia curva de setup) no se paga con tan poca duplicación.
-- La configuración entre módulos ya es genuinamente distinta caso a caso (poco realista en la práctica, pero si pasara, forzar un plugin común generaría más parámetros condicionales que ahorro real).
+**Resultado:** ambos módulos comparten la misma configuración de targets y Compose sin que nadie la haya copiado a mano. Si mañana se agrega un target nuevo, se cambia una sola vez en `convention.kmp-feature.gradle.kts`.
 
-**Trade-off real:** ganás consistencia y una única fuente de verdad para la configuración de módulos, pero pagás con una capa extra de indirección — alguien nuevo en el proyecto tiene que entender que `id("convention.kmp-feature")` no es un plugin de JetBrains sino uno propio, y para ver "qué hay realmente configurado" tiene que ir a mirar `build-logic/` en vez de tenerlo todo a la vista en el `build.gradle.kts` del módulo. Es la misma lógica que un `BaseViewModel` abstracto: centralizar ahorra repetición, pero agrega un nivel de indirección que hay que conocer.
+## 5. Buenas prácticas y errores comunes
 
-## 5. Caso trampa
+Checklist para auditar convention plugins escritos por una IA:
 
-Te preguntan: *"Si dos features necesitan casi la misma configuración pero una tiene una dependencia extra muy específica (por ejemplo, `:feature:cards` necesita una librería de escaneo de tarjetas que ninguna otra feature usa), ¿esa dependencia va dentro del convention plugin `convention.kmp-feature` para que esté disponible 'por las dudas'?"*
-
-La respuesta que parece práctica es "sí, así queda disponible en todos lados y no hay que tocar nada si otra feature la necesita después". Es la respuesta incorrecta: meter dependencias específicas de una sola feature dentro de un convention plugin compartido rompe el propósito del plugin (configuración genuinamente común a *todas* las features que lo aplican) y además infla el build de features que ni la necesitan — cada módulo termina cargando dependencias que no usa, lo cual además reintroduce indirectamente el problema de acoplamiento que la modularización buscaba evitar. Lo correcto es declarar esa dependencia puntual en el `build.gradle.kts` propio de `:feature:cards`, después de aplicar el convention plugin base — exactamente como en el ejemplo mínimo de la sección 3, donde `:core:database` se agrega a mano en el módulo que lo necesita, no en el plugin.
-
-## 6. Conexión con Timbax
-
-Timbax hoy no tiene convention plugins porque no los necesita — es un único módulo `:shared`, así que no hay nada que centralizar entre módulos. Este archivo conecta directo con el anterior (`modularizacion_por_feature.md`): los convention plugins no son una herramienta independiente, son la solución al costo colateral de modularizar. Si algún día Timbax se modulariza (el escenario hipotético de `:core:scoring` + `:feature:chinchon`/`:feature:truco`/`:feature:generala` del archivo anterior), ese sería exactamente el momento de introducir un `build-logic` con un plugin `convention.kmp-game-feature` — porque ahí sí habría 3+ módulos repitiendo la misma config de targets y dependencias base de scoring.
+- **¿Hay dependencias específicas de una sola feature metidas en el plugin compartido?** Si el plugin `convention.kmp-feature` incluye una librería que solo usa una feature (por ejemplo, un SDK de escaneo de tarjetas), está mal — eso infla el build de todas las features que aplican el plugin, aunque no la necesiten. Esa dependencia puntual va en el `build.gradle.kts` propio del módulo, después de aplicar el plugin base.
+- **¿Se creó un `build-logic` para 2-3 módulos?** Si el proyecto tiene poca superficie, un convention plugin agrega indirección (alguien nuevo tiene que entender que `id("convention.kmp-feature")` no es un plugin de JetBrains sino uno propio) sin que la duplicación evitada lo justifique. Verificar que haya 4-5+ módulos con configuración repetida antes de introducir esta capa.
+- **¿El plugin mezcla varias responsabilidades en un solo archivo?** Si `convention.kmp-feature` termina configurando cosas muy distintas (targets, Compose, y además reglas de testing, y además detekt), puede valer la pena separarlo en plugins más chicos y específicos en vez de uno monolítico que todos aplican aunque no necesiten todo.
+- **¿La configuración del plugin sigue siendo visible o quedó "escondida"?** Si alguien audita `feature/orders/build.gradle.kts` y no entiende de dónde salen los targets configurados, falta documentación mínima en el plugin o un comentario que indique dónde mirar (`build-logic/`).
+- **¿Hay inconsistencia entre módulos que deberían usar el mismo plugin?** Si dos features nuevas terminaron con configuración de targets ligeramente distinta a mano en vez de aplicar el plugin existente, es una señal de que el plugin no se está usando consistentemente — auditar que todo módulo nuevo lo aplique en vez de copiar `build.gradle.kts` de otro.
