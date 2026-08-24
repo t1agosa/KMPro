@@ -1,18 +1,40 @@
 # squash_y_conflictos
 
-## 1. Qué es
+## 1. Mapa del flujo
+
+```mermaid
+flowchart TD
+    A["3 commits en feature/order-discount:<br/>wip, fix typo, ahora sí anda"] -->|"git rebase -i HEAD~3<br/>(squash)"| B["1 commit limpio:<br/>feat: agregar descuento a Order"]
+    B --> C["Merge a main"]
+    D["main modifica OrdersRepository"] -.->|"en paralelo"| E["feature/order-discount<br/>modifica el mismo archivo"]
+    E --> F{"¿Mismas líneas?"}
+    F -->|Sí| G["Conflicto de merge:<br/>Git no puede decidir"]
+    F -->|No| C
+    G --> H["Resolución manual:<br/>entender intención de ambos cambios"]
+    H --> C
+```
+
+El diagrama separa dos mecánicas distintas que conviven en el mismo momento del flujo (integrar una rama a `main`): el squash colapsa el ruido *interno* de una rama antes o durante el merge; el conflicto surge cuando dos ramas tocaron las mismas líneas de forma incompatible, sin importar si después se integra con squash, merge o rebase.
+
+## 2. Qué es y cómo funciona
 
 **Squash** es una operación que toma todos los commits de una rama y los combina en uno solo antes de mergearlos a la rama principal. Es la tercera opción además de merge y rebase directos, y en GitHub aparece típicamente como "Squash and merge" al cerrar un Pull Request.
 
-**Conflicto de merge** es lo que ocurre cuando dos ramas modificaron las mismas líneas de un archivo de forma distinta, y Git no puede decidir automáticamente cuál versión es la correcta — pasa tanto al usar `merge` como al usar `rebase`.
+**Conflicto de merge** es lo que ocurre cuando dos ramas modificaron las mismas líneas de un archivo de forma distinta, y Git no puede decidir automáticamente cuál versión es la correcta — pasa tanto al usar `merge` como al usar `rebase` (ver `merge_vs_rebase.md`).
 
-## 2. El problema que resuelve
+Son mecánicas independientes que suelen aparecer juntas: durante el desarrollo de una feature se acumulan commits intermedios (`wip`, `fix typo`, `arreglo real`) que no aportan nada al historial de `main` — el squash los colapsa en uno solo, limpio y descriptivo. Los conflictos, en cambio, no son un "error" de Git: son la consecuencia inevitable de que dos personas (o vos mismo en dos ramas) toquen la misma línea de forma distinta. Git no tiene forma de saber cuál versión es la "correcta" en términos de intención de negocio, así que te lo devuelve para que decidas vos.
 
-**Squash** resuelve el ruido de commits intermedios: durante el desarrollo de una feature hacés commits tipo `wip`, `fix typo`, `arreglo real`, `ahora sí anda` — commits que solo tenían sentido mientras trabajabas, pero que en el historial de `main` no aportan nada, solo ensucian. Squash colapsa todo eso en un commit limpio y descriptivo por feature completa.
+## 3. Cómo se ve en distintos contextos
 
-**Los conflictos** no son un "error" de Git — son la consecuencia inevitable de que dos personas (o vos mismo en dos ramas) toquen la misma línea de forma distinta. Git no tiene forma de saber cuál versión es la "correcta" en términos de intención de negocio, así que te lo devuelve para que decidas vos.
+En una **app de fitness** donde un dev trabaja tres días en una feature de "plan de entrenamiento semanal" y acumula quince commits (`wip`, `ahora sí compila`, `arreglo test`), el squash al mergear el PR deja en `main` un único commit `feat: agregar plan de entrenamiento semanal` — nadie necesita ver los quince pasos intermedios para entender qué cambió.
 
-## 3. Ejemplo mínimo comentado
+En una **app de e-commerce** con dos devs trabajando en paralelo, uno ajustando el cálculo de envío gratis y otro el cálculo de descuentos por cupón, ambos sobre el mismo archivo de `PriceCalculator`, es esperable un conflicto de merge al integrar la segunda rama: Git marca las líneas en disputa y alguien tiene que decidir cómo conviven ambas reglas de negocio, no simplemente "pegar las dos".
+
+## 4. Implementación real
+
+**Contexto:** el PO pidió agregar un descuento por primera compra a `Order`. Mientras desarrollás `feature/order-discount`, alguien más mergeó a `main` un cambio que también toca el cálculo de `totalAmount` en `OrdersRepository.kt` (para redondear a dos decimales).
+
+Primero, limpiás tu propia rama antes de abrir el PR:
 
 ```bash
 # squash manual: combina los últimos 3 commits en uno solo,
@@ -23,16 +45,14 @@ git rebase -i HEAD~3
 # con el commit anterior
 ```
 
-```bash
-# conflicto de merge: Git marca directamente el archivo afectado
-```
+Al traer los cambios de `main`, aparece el conflicto:
 
 ```kotlin
 <<<<<<< HEAD
-val score = player.score + 10
+val totalAmount = items.sumOf { it.price * it.quantity }.roundToTwoDecimals()
 =======
-val score = player.score * 1.1
->>>>>>> feature/bonus-multiplier
+val totalAmount = items.sumOf { it.price * it.quantity } * (1 - firstOrderDiscount)
+>>>>>>> feature/order-discount
 ```
 
 ```bash
@@ -40,7 +60,7 @@ val score = player.score * 1.1
 # (combinando si hace falta), y borrar los marcadores
 # <<<<<<<, =======, >>>>>>>
 
-git add ScoreCalculator.kt
+git add OrdersRepository.kt
 
 # si el conflicto surgió durante un rebase:
 git rebase --continue
@@ -49,21 +69,21 @@ git rebase --continue
 git commit
 ```
 
-## 4. Matriz de criterio
+La resolución correcta acá no es dejar ambas líneas — es entender que ambos cambios deben convivir: aplicar el descuento y **después** redondear, no una u otra por separado.
 
-| Concepto | Usar cuando | NO usar cuando | Trade-off real |
-|---|---|---|---|
-| **Squash** | Cerrar un PR con commits intermedios ruidosos (wip, fixes de typo) que no aportan valor al historial de `main` | La feature es grande y cada commit intermedio SÍ documenta una decisión útil de revisar por separado (poco común, pero pasa en refactors complejos) | Historial de `main` limpio (un commit = una feature), pero perdés la granularidad de los commits intermedios si alguna vez necesitás revisar el paso a paso |
-| **Resolución de conflictos** | Siempre que Git no pueda auto-mergear — no hay forma de evitarlo, solo de manejarlo bien | — (no es opcional, es inevitable en trabajo paralelo) | El costo es tiempo y atención: entender la intención de ambos cambios, no solo "pegar los dos" a ciegas |
+```kotlin
+// resolución real: ambas reglas de negocio combinadas con sentido,
+// no las dos líneas originales pegadas una debajo de la otra
+val totalAmount = (items.sumOf { it.price * it.quantity } * (1 - firstOrderDiscount))
+    .roundToTwoDecimals()
+```
 
-Pregunta típica: *"¿por qué muchos equipos usan squash merge por default en GitHub?"* → Porque mantiene el historial de `main` limpio y legible (un commit = una feature/fix completo), sin el ruido de los commits intermedios que solo tenían sentido mientras trabajabas.
+## 5. Buenas prácticas y errores comunes
 
-## 5. Caso trampa
+Checklist para auditar un squash o una resolución de conflicto que entregó una IA:
 
-**Situación:** Tenés un conflicto de merge en `ScoreCalculator.kt`. Ves los dos bloques (`<<<<<<<` y `>>>>>>>`) y, para resolverlo rápido, dejás **ambas** líneas de código, una debajo de la otra, pensando "así no pierdo el trabajo de nadie".
-
-**Por qué la respuesta obvia es incorrecta:** Un conflicto no es un problema de "falta contenido", es un problema de **decisión contradictoria**. En el ejemplo del punto 3, una rama calcula `score + 10` y la otra `score * 1.1` — son dos reglas de negocio distintas e incompatibles para lo mismo. Dejar las dos líneas no es "no perder nada": es dejar código que probablemente ni compile bien, o que sí compile pero ejecute dos operaciones donde el negocio esperaba una sola, produciendo un resultado que nadie pidió. Resolver un conflicto bien significa entender **por qué** cada rama hizo ese cambio (leer el commit message, el contexto del PR) y decidir cuál regla es la vigente — o si hay que combinarlas de una forma que tenga sentido real (por ejemplo, aplicar el bonus multiplicador y después sumar el fijo), no pegar ambas líneas literalmente una arriba de la otra.
-
-## 6. Conexión con Timbax
-
-En Timbax, trabajando solo, los conflictos de merge son raros pero no imposibles — pasan, por ejemplo, si tenés dos ramas de feature abiertas en paralelo (una tocando `ScoreCalculator.kt` para Chinchón, otra tocando el mismo archivo para Truco) y las mergeás en desorden. El squash, en cambio, lo usás todo el tiempo sin pensarlo: cada PR tuyo en GitHub, aunque tenga 8 commits de `wip` mientras probabas la lógica de puntaje, termina en `main` como un solo commit `feat: agregar cálculo de puntaje bonus en Chinchón` — coherente con la convención de conventional commits que ya usás en el resto del proyecto.
+- [ ] **¿El commit final del squash describe la feature completa, no el último commit intermedio?** Un squash mal hecho puede terminar dejando como mensaje final algo como `fix typo` en vez de `feat: agregar descuento a Order` — hay que reescribir el mensaje al momento de squashear, no heredar el último al azar.
+- [ ] **¿La resolución de un conflicto combina la intención de ambos cambios, o solo "pegó" las dos versiones?** Dejar ambas líneas de un conflicto sin entender qué hace cada una casi nunca compila bien, y si compila, probablemente ejecute dos operaciones donde el negocio esperaba una sola.
+- [ ] **¿Se leyó el contexto de por qué cada rama hizo ese cambio?** (commit message, descripción del PR) antes de decidir qué código queda. Resolver un conflicto sin ese contexto es adivinar, no decidir.
+- [ ] **¿Quedaron marcadores de conflicto (`<<<<<<<`, `=======`, `>>>>>>>`) sin borrar en el archivo final?** Es un error común al resolver a las apuradas — el código puede llegar a compilar igual si los marcadores caen en un comentario o string, pero deja basura en el archivo.
+- [ ] **¿Se eligió squash para una feature con commits intermedios ruidosos, y merge/rebase normal para una donde cada commit documenta una decisión útil?** Squashear una serie de commits que sí valía la pena revisar por separado (ej. un refactor grande en pasos) pierde esa granularidad para siempre.

@@ -1,61 +1,82 @@
 # merge_vs_rebase
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-**Merge** y **rebase** son las dos formas de traer cambios de una rama a otra en Git. Ambos resuelven el mismo problema ("quiero los commits de la rama A también en la rama B"), pero lo hacen de forma completamente distinta:
+```mermaid
+gitGraph
+   commit id: "main: v1"
+   commit id: "main: v2"
+   branch feature/order-history-screen
+   checkout feature/order-history-screen
+   commit id: "feat: UseCase"
+   commit id: "feat: ViewModel"
+   checkout main
+   commit id: "main: v3 (otro dev)"
+   checkout feature/order-history-screen
+   commit id: "rebase sobre main" type: HIGHLIGHT
+   checkout main
+   merge feature/order-history-screen id: "merge commit"
+```
 
-- **Merge** crea un nuevo commit (el "merge commit") que une el historial de ambas ramas, preservando exactamente cómo pasaron las cosas en el tiempo.
-- **Rebase** reescribe el historial de tu rama, tomando tus commits y reaplicándolos uno por uno sobre la punta actual de la otra rama, como si hubieras empezado a trabajar desde ahí. El resultado es un historial lineal, sin merge commits.
+El diagrama muestra los dos momentos donde aparece la disyuntiva: mientras la rama de feature está en curso (ahí se decide si rebasear contra `main` para no quedar atrás), y al integrar el PR aprobado (ahí normalmente se usa merge, para no reescribir historial que ya es compartido). Son dos decisiones distintas, en dos momentos distintos del mismo flujo.
 
-## 2. El problema que resuelve
+## 2. Qué es y cómo funciona
 
-Cuando dos ramas avanzan en paralelo (por ejemplo, vos trabajando en `feature/players-list` mientras `main` sigue recibiendo otros commits), en algún momento necesitás juntar ambos caminos. Sin un mecanismo explícito para esto, no habría forma de combinar el trabajo de ambas ramas manteniendo la integridad del historial — y la pregunta de fondo que separa a merge de rebase es **si te importa preservar exactamente cómo pasaron las cosas, o si preferís un historial más limpio y lineal aunque eso implique reescribir hashes de commits**.
+**Merge** y **rebase** son las dos formas de traer cambios de una rama a otra en Git. Ambos resuelven el mismo problema ("quiero los commits de la rama A también en la rama B"), pero con mecánicas opuestas:
 
-## 3. Ejemplo mínimo comentado
+- **Merge** crea un nuevo commit (el "merge commit") que une el historial de ambas ramas, preservando exactamente cómo pasaron las cosas en el tiempo — incluidos los momentos en que ambas ramas avanzaron en paralelo.
+- **Rebase** reescribe el historial de tu rama: toma tus commits y los reaplica uno por uno sobre la punta actual de la otra rama, como si hubieras empezado a trabajar desde ahí. El resultado es un historial lineal, sin merge commits — pero con **hashes nuevos** para cada commit reaplicado.
+
+Esa última palabra — *reescribe* — es la que separa a ambos en la práctica: merge nunca toca commits existentes, rebase sí. Por eso rebase es seguro solo mientras esos commits no hayan sido compartidos con nadie más.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness** donde cada dev mantiene su propia rama de feature sin que nadie más la baje, rebasear contra `main` antes de abrir el PR es rutina diaria: mantiene la rama al día con lo último de `main` y deja un historial lineal fácil de leer en el diff del PR, sin ensuciarlo con merges intermedios de "traje los cambios de main".
+
+En una **app de e-commerce** con un equipo grande donde dos personas a veces colaboran sobre la misma rama de feature (por ejemplo, mientras arman juntos una integración de checkout compleja), rebasear esa rama compartida sin avisar es directamente riesgoso: en el momento en que el segundo dev hace `pull`, se encuentra con hashes que ya no coinciden con lo que tiene localmente, y Git no tiene forma limpia de reconciliar eso.
+
+## 4. Implementación real
+
+**Contexto:** el PO pidió agregar `RefreshOrdersUseCase` para poder refrescar el historial de pedidos manualmente. Trabajás solo en tu rama `feature/refresh-orders`, pero `main` avanzó mientras tanto con otro fix.
 
 ```bash
 # MERGE: crea un commit extra que documenta la unión de ambas ramas
 git checkout main
-git merge feature/players-list
-# resultado: "Merge branch 'feature/players-list' into main"
+git merge feature/refresh-orders
+# resultado: "Merge branch 'feature/refresh-orders' into main"
 # el historial queda con "forma de diamante"
 ```
 
 ```bash
 # REBASE: reescribe tus commits como si arrancaran después
 # del último commit de main (nuevos hashes)
-git checkout feature/players-list
+git checkout feature/refresh-orders
 git rebase main
 # resultado: historial lineal, sin merge commit
 ```
 
 ```bash
-# flujo típico en equipo: rebase tu propia rama contra main
-# ANTES de abrir el PR, para traer los últimos cambios sin ensuciar
-# el historial y resolver conflictos de a poco
-git checkout feature/players-list
+# flujo típico: rebaseás tu propia rama contra main ANTES de abrir el PR,
+# para traer los últimos cambios y resolver conflictos de a poco,
+# en vez de que aparezcan todos juntos al momento de mergear
+git checkout feature/refresh-orders
 git rebase main
 
-# luego, el PR se mergea a main normalmente (generalmente squash, ver archivo siguiente)
+# si aparece un conflicto en OrdersRepository.kt durante el rebase:
+# 1. resolver el archivo a mano
+# 2. git add OrdersRepository.kt
+# 3. git rebase --continue
+
+# luego, el PR se mergea a main normalmente (generalmente squash,
+# ver squash_y_conflictos.md)
 ```
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes
 
-| Operación | Usar cuando | NO usar cuando | Trade-off real |
-|---|---|---|---|
-| **Rebase** | Actualizar tu propia rama de feature contra `main` antes de abrir el PR — rama que nadie más bajó | La rama ya fue pusheada y **alguien más la bajó** (rama compartida) | Historial lineal y limpio, pero reescribe hashes — peligroso si otros ya tienen esos commits localmente |
-| **Merge** | Integrar oficialmente un PR aprobado a la rama principal | Nunca es realmente "incorrecto" usarlo — es la opción segura por defecto | No reescribe nada (siempre seguro), pero ensucia el historial con merge commits si se abusa en ramas propias |
+Checklist para auditar una decisión de merge vs. rebase (propia o sugerida por una IA):
 
-**Regla de oro:** nunca hagas rebase de una rama que ya compartiste con otros, salvo que todo el equipo lo sepa y coordine explícitamente.
-
-Pregunta típica: *"¿cuándo usarías rebase y cuándo merge?"* → Rebase para mantener tu propia rama actualizada contra `main` antes de abrir PR (historial limpio, la rama es tuya, nadie más la bajó); merge para integrar oficialmente un PR aprobado a la rama principal (no reescribe historial compartido).
-
-## 5. Caso trampa
-
-**Situación:** Estás trabajando en `feature/players-list` junto a otro compañero que también bajó esa misma rama para ayudarte con un componente. Vos hacés `git rebase main` en tu rama local para "limpiar el historial antes del PR", y pusheás con `git push --force`.
-
-**Por qué la respuesta obvia es incorrecta:** La regla que aprendiste ("rebasea tu rama antes del PR") asume que la rama es **tuya y de nadie más**. Acá dejó de serlo en el momento en que tu compañero la bajó. Al rebasear, reescribiste los hashes de tus commits — cuando tu compañero haga `git pull`, Git va a ver dos historiales divergentes (el suyo, basado en los hashes viejos, y el tuyo nuevo en el remoto) y va a generar conflictos confusos o, peor, un merge accidental que duplica commits. El force push encima puede pisar directamente el trabajo que tu compañero ya había subido. La señal correcta acá no es "¿es mi rama de feature?" sino "¿alguien más además de mí tiene una copia local de estos commits?" — si la respuesta es sí, se coordina con el equipo antes de rebasear, o directamente se usa merge.
-
-## 6. Conexión con Timbax
-
-Como Timbax hoy lo desarrollás vos solo, cualquier rama de feature es, por definición, una rama que nadie más bajó — por eso rebasear contra `main` antes de cerrar una feature es siempre seguro y te deja un historial lineal fácil de leer en el portfolio de GitHub. El caso trampa de arriba es exactamente el escenario que aparecería el día que sumes un colaborador a Timbax (o en cualquier trabajo en equipo): ahí la regla deja de ser automática y pasa a depender de si la rama sigue siendo "tuya" en términos exclusivos.
+- [ ] **¿La rama que se va a rebasear tiene un solo dueño?** Si otra persona ya bajó esa misma rama localmente, rebasear reescribe hashes que esa persona ya tiene — regla dura, sin excepción salvo coordinación explícita del equipo.
+- [ ] **¿Se usó `git push --force` sobre una rama compartida?** Es la combinación más peligrosa: rebase + force push sobre una rama que otro también tiene localmente puede pisar directamente su trabajo. Si una IA sugiere `--force` sin verificar quién más usa esa rama, es una bandera roja.
+- [ ] **¿Se está rebaseando la integración del PR a `main`, en vez de mergearla?** El merge del PR aprobado a la rama principal normalmente va con merge (o squash), no con rebase — rebasear `main` mismo reescribiría el historial compartido de todo el equipo.
+- [ ] **¿El propósito es "limpiar antes de abrir PR" o "integrar un PR ya aprobado"?** Son los dos casos de uso típicos, y cada uno tiene su herramienta: rebase para lo primero (tu rama, historial lineal), merge para lo segundo (integración oficial, sin reescribir nada).
+- [ ] **Ante un conflicto durante rebase, ¿se resuelve commit por commit?** A diferencia de un conflicto de merge (una sola resolución), un rebase puede pedir resolver el mismo archivo varias veces — una por cada commit reaplicado que lo toca. Si una IA resuelve todo de una sin entender esto, puede perder cambios intermedios.

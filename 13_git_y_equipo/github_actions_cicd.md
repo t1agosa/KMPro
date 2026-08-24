@@ -1,16 +1,47 @@
 # github_actions_cicd
 
-## 1. Qué es
+## 1. Mapa del flujo
+
+```mermaid
+flowchart TD
+    A["Evento: push / pull_request<br/>contra main"] --> B["GitHub Actions dispara<br/>el workflow (YAML)"]
+    B --> C["Job 'test' en un runner<br/>(máquina virtual efímera)"]
+    C --> D["actions/checkout: clona el repo"]
+    D --> E["actions/setup-java: instala el JDK"]
+    E --> F["./gradlew test<br/>./gradlew detekt"]
+    F --> G{"¿Resultado?"}
+    G -->|Falla| H["Check en rojo en el PR"]
+    G -->|Pasa| I["Check en verde en el PR"]
+    I --> J{"Branch protection<br/>exige CI verde + review?"}
+    J -->|Sí| K["Botón 'Merge' habilitado"]
+    J -->|No| L["Botón 'Merge' habilitado<br/>igual, aunque falle CI"]
+    K --> M["CD opcional: build firmada<br/>a Firebase App Distribution / store"]
+```
+
+El diagrama muestra el punto crítico de todo el módulo: el CI en verde (nodo I) y el botón de merge habilitado (nodo K o L) son cosas distintas — sin branch protection configurada explícitamente, un CI en rojo no bloquea nada por sí solo (rama L).
+
+## 2. Qué es y cómo funciona
 
 **GitHub Actions** es el sistema de automatización de GitHub: ejecuta *workflows* (scripts definidos en YAML) en respuesta a eventos del repositorio (push, pull request, release, etc.), sin depender de que alguien corra esos pasos a mano.
 
 **CI (Continuous Integration)** es la práctica de correr automáticamente tests y validaciones cada vez que se sube código, para detectar problemas apenas se introducen. **CD (Continuous Deployment/Delivery)** extiende esa automatización para también desplegar — subir una build a Firebase App Distribution, TestFlight, o publicar a una store.
 
-## 2. El problema que resuelve
+Sin CI, cada dev corre tests y lint "a mano" antes de subir código, lo cual depende 100% de la disciplina individual. Sin CD, cada release es un proceso manual repetitivo (compilar, firmar, subir) propenso a errores humanos.
 
-Sin CI, cada dev corre tests y lint "a mano" antes de subir código — lo cual depende 100% de la disciplina individual: alguien apurado, o que se olvida, sube código roto a `main` y nadie se entera hasta que otro lo baja y le explota localmente (o peor, hasta que llega a producción). Sin CD, cada release es un proceso manual repetitivo (compilar, firmar, subir) propenso a errores humanos y que no escala si el equipo crece o las releases se vuelven más frecuentes.
+Estructura de un workflow YAML:
+- `on:` define el trigger (en el diagrama, cada push o PR contra `main`).
+- `jobs:` cada job corre en un runner (máquina virtual efímera) independiente, potencialmente en paralelo con otros jobs.
+- `steps:` acciones secuenciales dentro de un job — `uses:` reutiliza una Action ya escrita (de GitHub o de la comunidad), `run:` ejecuta un comando de shell directo.
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness** con un equipo de 3 personas, un único workflow de CI que corre en cada PR (`gradlew test` + `gradlew detekt`) alcanza para atrapar la mayoría de los errores antes de que lleguen a review humano — sin necesidad todavía de un pipeline de CD, porque las builds de prueba se instalan manualmente en dispositivos del equipo.
+
+En una **app de e-commerce** con testers externos y releases semanales, el pipeline se extiende: además del job de test, un segundo job (que solo corre si el primero pasa, y solo en pushes a `main`) firma la build y la sube automáticamente a Firebase App Distribution, notificando a los testers sin que nadie tenga que generar el `.apk` a mano.
+
+## 4. Implementación real
+
+**Contexto:** el PO pidió que cada PR corra los tests automáticamente antes de poder mergear, para no depender de que cada dev se acuerde de correrlos localmente.
 
 ```yaml
 name: CI
@@ -23,11 +54,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
       - name: Run tests
         run: ./gradlew test
       - name: Run lint
@@ -43,27 +74,24 @@ jobs:
   run: ./gradlew assembleRelease
 ```
 
-Conceptos clave del archivo YAML:
-- `on:` define el trigger (acá, cada PR contra `main`).
-- `jobs:` cada job corre en un runner (máquina virtual) independiente, potencialmente en paralelo con otros jobs.
-- `steps:` acciones secuenciales dentro de un job — `uses:` reutiliza una Action ya escrita (de GitHub o de la comunidad), `run:` ejecuta un comando de shell directo.
+## 5. Buenas prácticas y errores comunes
 
-## 4. Matriz de criterio
+Checklist para auditar un workflow de CI/CD que entregó una IA:
 
-| Concepto | Usar cuando | NO usar cuando | Trade-off real |
-|---|---|---|---|
-| **CI (tests + lint automáticos)** | Siempre que haya más de una persona tocando el repo, o incluso solo (para no confiar en la memoria de correr tests a mano) | — (prácticamente no hay escenario donde CI no sume valor, salvo prototipos totalmente descartables) | Tiempo de espera en cada PR (minutos), a cambio de detectar problemas antes de que lleguen a `main` |
-| **CD hacia stores/distribución interna** | Releases frecuentes, o builds de prueba que un equipo (QA, testers) necesita bajar seguido | Proyecto en etapa muy temprana donde cada build manual sirve para revisar el proceso en sí | Ahorra trabajo repetitivo y reduce error humano, pero exige configurar correctamente firma de builds y secretos — mal configurado, puede publicar algo no revisado |
-| **Branch protection rules** | Cualquier repo donde `main` representa código en producción o cerca de eso | Repos personales de prueba/aprendizaje sin consecuencias reales de romper `main` | Fuerza que el flujo de PR + CI sea obligatorio, no una convención que alguien puede saltearse por apuro |
+- [ ] **¿El workflow por sí solo bloquea el merge, o solo informa?** Que el CI corra y se vea en rojo no impide que alguien apriete "Merge" igual. Solo **branch protection rules** configuradas explícitamente (exigir status checks en verde antes de habilitar el botón) convierten esa información en una regla imposible de saltear.
+- [ ] **¿Las Actions están fijadas a una versión mayor razonable y no a `@master`/`@main`?** Fijar a una rama móvil de una Action de terceros expone el pipeline a cambios inesperados (o maliciosos) sin previo aviso; fijar a una versión mayor (`@v7`) es el balance estándar entre estabilidad y mantenimiento.
+- [ ] **¿Algún secreto aparece hardcodeado en el YAML o en un log de `run:`?** Las API keys deben vivir siempre en `secrets.*`, nunca en texto plano dentro del workflow — ver `secretos_gitignore.md`.
+- [ ] **Si el workflow usa `pull_request_target` para un repo que acepta PRs de forks, ¿evita ejecutar código del fork con privilegios del repo base?** Es un vector real de ataque ("pwn request"): `pull_request_target` corre con el `GITHUB_TOKEN` y los secrets del repo base, así que checkoutear y ejecutar el código de un PR externo ahí es peligroso. `actions/checkout` bloquea este patrón por default desde su versión 7 salvo que se habilite explícitamente.
+- [ ] **¿El job de CD depende de que el job de CI haya pasado?** Un pipeline mal encadenado podría desplegar una build sin que los tests hayan corrido — el job de deploy debería declarar `needs: test` (o equivalente) para no desacoplarse del resultado de CI.
 
-Pregunta típica: *"¿cómo asegurarías que nadie mergea código roto a main?"* → Configurando branch protection rules que exijan CI en verde y aprobación de review antes de habilitar el botón de merge — no confiando en que cada dev corra los tests a mano antes de mergear.
+## 6. Profundización: branch protection rules como capa separada del CI
 
-## 5. Caso trampa
+Es un error común pensar que configurar el workflow de CI ya "resuelve" el problema de código roto llegando a `main`. El CI, por sí solo, es **información**: corre, muestra un check verde o rojo en el PR, y ahí termina su responsabilidad. Nada en GitHub Actions impide que alguien con permisos de escritura apriete "Merge" con ese check en rojo, salvo que exista una regla explícita que lo prohíba.
 
-**Situación:** Configurás un workflow de CI que corre tests y lint en cada PR, y lo das por "resuelto": ya no hace falta branch protection porque "el CI ya corre y si falla, se ve en rojo en el PR — el equipo no va a mergear algo en rojo".
+Esa regla vive en un lugar distinto del repositorio — **Settings → Branches → Branch protection rules** — y es una capa de configuración completamente separada del archivo YAML del workflow:
 
-**Por qué la respuesta obvia es incorrecta:** Que el CI corra y muestre el resultado no impide que alguien mergee igual. Sin **branch protection rules** configuradas explícitamente, el botón de "Merge" en GitHub sigue habilitado aunque el check de CI esté en rojo — queda librado a que la persona *elija* no apretarlo, exactamente el mismo problema de depender de la disciplina individual que el CI se supone que resuelve. El CI por sí solo es información; branch protection es lo que convierte esa información en una regla imposible de saltear. Es un error común pensar que tener el pipeline configurado ya cierra el problema, cuando falta el segundo paso que lo hace realmente obligatorio.
+- **Require status checks to pass before merging**: el botón de merge queda deshabilitado mientras el check de CI no esté en verde.
+- **Require a pull request before merging** (+ cantidad mínima de aprobaciones): impide el push directo a `main`, forzando el flujo de PR descrito en `pull_requests_code_review.md`.
+- **Require branches to be up to date before merging**: exige que la rama del PR tenga los últimos cambios de `main` antes de mergear — evita que un PR viejo, testeado contra una versión anterior de `main`, se mergee sin haber corrido CI contra el código actual.
 
-## 6. Conexión con Timbax
-
-Timbax se beneficia de CI incluso trabajando solo: un workflow que corre `./gradlew test` en cada PR (o incluso en cada push a una rama de feature) te avisa si rompiste algo antes de que vos mismo lo notes recién al abrir la app — especialmente útil en un proyecto KMP donde un cambio en `commonMain` puede romper silenciosamente el build de una plataforma que no estás mirando en ese momento (por ejemplo, tocar algo y romper el target iOS sin darte cuenta porque estás compilando y probando solo en Android). El paso de CD (subir una build a Firebase App Distribution automáticamente al mergear a `main`) es el siguiente escalón natural una vez que Timbax tenga testers externos probando versiones antes de publicarlas en la store.
+La distinción importa porque son dos configuraciones independientes que hay que auditar por separado: un repo puede tener un workflow de CI impecable y aun así no estar protegido, si nadie activó las branch protection rules correspondientes.
