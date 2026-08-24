@@ -1,42 +1,75 @@
 # BuildKonfig Multi-Ambiente
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-BuildKonfig es la librería que ya vimos en `todosobreKMP` (sección Gradle) para manejar variables de entorno de forma type-safe en KMP. Este archivo profundiza específicamente en su uso para **múltiples ambientes** (dev/staging/prod): genera un objeto Kotlin (tipo `BuildConfig` de Android, pero multiplataforma) con los valores correspondientes al ambiente activo, accesible desde `commonMain`.
+```mermaid
+flowchart TD
+    A["buildkonfig.flavor=staging<br/>(gradle.properties o -P en CI)"] --> B["Plugin BuildKonfig lee la property<br/>al evaluar build.gradle.kts"]
+    B --> C{"¿Hay defaultConfigs('staging')?"}
+    C -->|Sí| D["Se aplican esos valores,<br/>sobrescribiendo defaultConfigs base"]
+    C -->|No, typo o flavor inexistente| E["Cae silenciosamente a<br/>defaultConfigs base — sin error"]
+
+    D --> F{"¿Hay targetConfigs<br/>específico de plataforma?"}
+    F -->|Sí| G["targetConfigs('flavor') gana<br/>sobre defaultConfigs('flavor')"]
+    F -->|No| H["Se mantiene el valor<br/>de defaultConfigs('staging')"]
+
+    G --> I["generateBuildKonfig<br/>genera el objeto Kotlin"]
+    H --> I
+    E --> I
+
+    I --> J["Objeto type-safe accesible<br/>desde commonMain (ej. TimbaxConfig.BASE_URL)"]
+    J --> K["Consumido exclusivamente<br/>en la capa data (ej. HttpClient de Ktor)"]
+```
+
+**Punto clave del diagrama:** la prioridad de merge es `targetConfigs("flavor")` > `targetConfigs` (sin flavor) > `defaultConfigs("flavor")` > `defaultConfigs` (base) — lo más específico por plataforma+flavor siempre gana. Y si el nombre del flavor no matchea ningún `defaultConfigs("nombre")` declarado, **no hay error de compilación**: silenciosamente se usa la base.
+
+---
+
+## 2. Qué es y cómo funciona
+
+BuildKonfig es la librería que ya vimos en `todosobreKMP` (sección Gradle) para manejar variables de entorno de forma type-safe en KMP. Este archivo profundiza específicamente en su uso para **múltiples ambientes** (dev/staging/prod): genera un objeto Kotlin (equivalente al `BuildConfig` de Android, pero multiplataforma) con los valores correspondientes al ambiente activo, accesible desde `commonMain`.
 
 La selección de ambiente se hace con una property de Gradle: `buildkonfig.flavor`, seteada en `gradle.properties` o pasada por línea de comando (`-Pbuildkonfig.flavor=staging`) — **es independiente del flavor de Android Gradle Plugin**, aunque en la práctica se sincronizan a propósito (ver `flavors_y_schemes_por_plataforma.md`).
 
-## 2. El problema que resuelve
+**El problema que resuelve:** sin esto, la única forma de que el código compartido (`domain`/`data`) sepa contra qué URL pegarle es hardcodear la URL y cambiarla a mano antes de cada build (frágil, propenso a error humano), o duplicar lógica de configuración por plataforma (un `BuildConfig` en Android, un `.xcconfig`/`Info.plist` en iOS) sin fuente única de verdad. BuildKonfig centraliza la definición en un solo lugar (`build.gradle.kts` del módulo compartido) y genera el objeto correspondiente para cada plataforma automáticamente.
 
-Sin esto, la única forma de que el código compartido (`domain`/`data`) sepa contra qué URL pegarle es:
-- Hardcodear la URL y cambiarla a mano antes de cada build (frágil, propenso a error humano).
-- Duplicar lógica de configuración por plataforma (un `BuildConfig` en Android, un `.xcconfig`/`Info.plist` en iOS), sin una fuente única de verdad ni acceso type-safe desde Kotlin compartido.
+**Vigencia en 2026:** BuildKonfig sigue activamente mantenida (última release en junio 2026) y no es solo una opción de la comunidad — la documentación oficial de Android para el nuevo plugin `com.android.kotlin.multiplatform.library` la recomienda explícitamente como alternativa, precisamente porque ese plugin (single-variant) no genera `BuildConfig` propio para KMP.
 
-BuildKonfig centraliza la definición en un solo lugar (`build.gradle.kts` del módulo compartido) y genera el objeto correspondiente para cada plataforma automáticamente.
+---
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
+
+**App de fitness con feature flags por ambiente:** además de la URL del backend, BuildKonfig es el lugar natural para exponer flags booleanos (`ENABLE_BETA_WORKOUTS = true` en dev, `false` en prod) que no ameritan un sistema de feature flags remoto completo. Es configuración fija en compile-time, no algo que un PO vaya a togglear en producción sin recompilar.
+
+**App de e-commerce con distintas API keys de analítica por ambiente:** un caso típico de `targetConfigs` combinado con `defaultConfigs("flavor")` — el mismo ambiente `staging` puede necesitar una API key de Android distinta de la de iOS (dos proyectos separados en la consola del proveedor de analítica), mientras que la URL del backend de staging es la misma para ambas plataformas. Ahí es donde la jerarquía de prioridad de merge (plataforma+flavor por sobre solo flavor) deja de ser un detalle técnico y se vuelve necesaria.
+
+---
+
+## 4. Implementación real
+
+**Pedido del PO:** *"Quiero que el backend de pedidos apunte a un servidor de pruebas cuando compilamos staging, y al backend real en producción — sin que nadie tenga que acordarse de cambiar una URL a mano antes de cada build."*
 
 ```kotlin
 // shared/build.gradle.kts
 import com.codingfeline.buildkonfig.compiler.FieldSpec.Type.STRING
 
 buildkonfig {
-    packageName = "com.timbax.shared"
-    objectName = "TimbaxConfig"
+    packageName = "com.example.orders.shared"
+    objectName = "OrdersConfig"
 
     // defaultConfigs es obligatorio: valores base si no hay flavor activo
     defaultConfigs {
-        buildConfigField(STRING, "BASE_URL", "https://dev.timbax.com")
+        buildConfigField(STRING, "BASE_URL", "https://dev.orders-api.com")
     }
 
     // defaultConfigs("nombre") sobrescribe los valores base cuando
     // buildkonfig.flavor coincide con "nombre"
     defaultConfigs("staging") {
-        buildConfigField(STRING, "BASE_URL", "https://staging.timbax.com")
+        buildConfigField(STRING, "BASE_URL", "https://staging.orders-api.com")
     }
 
     defaultConfigs("prod") {
-        buildConfigField(STRING, "BASE_URL", "https://api.timbax.com")
+        buildConfigField(STRING, "BASE_URL", "https://api.orders-app.com")
     }
 }
 ```
@@ -47,32 +80,23 @@ buildkonfig.flavor=staging
 ```
 
 ```kotlin
-// uso desde código compartido, ya type-safe
-class KtorClientProvider {
-    fun baseUrl(): String = TimbaxConfig.BASE_URL
+// uso desde código compartido, ya type-safe — capa data exclusivamente
+class OrdersHttpClientProvider {
+    fun baseUrl(): String = OrdersConfig.BASE_URL
 }
 ```
 
-La prioridad de merge cuando hay valores en varios niveles es: `targetConfigs("flavor")` > `targetConfigs` (sin flavor) > `defaultConfigs("flavor")` > `defaultConfigs` (base) — es decir, lo más específico por plataforma+flavor siempre gana.
+El `GetOrderHistoryUseCase` y el `OrdersViewModel` nunca ven `OrdersConfig` directamente — reciben datos ya resueltos a través del `OrderRepository`. Es el `RepositoryImpl`/factory de Ktor, en la capa `data`, el único punto que necesita saber si `BASE_URL` es de staging o de prod.
 
-## 4. Matriz de criterio
+---
 
-| Escenario | Usar BuildKonfig | NO usar / alternativa |
-|---|---|---|
-| Configuración simple: URLs, flags de feature, nombres por ambiente | Sí, caso de uso central | — |
-| Necesitás que el valor esté disponible sin recompilar (cambiar en runtime) | No — BuildKonfig genera valores fijos en compile-time | Remote Config (Firebase) o un endpoint de configuración remota |
-| API keys realmente sensibles (no solo config) | Usar BuildKonfig como transporte, pero el valor real nunca se commitea — se inyecta desde `gradle.properties` local (gitignored) o GitHub Secrets en CI | Ver `secretos_gitignore.md` — BuildKonfig no reemplaza la gestión de secretos, solo la expone type-safe |
-| Distinción de valores por plataforma dentro del mismo ambiente (ej: distinto `Client ID` en Android vs iOS para el mismo backend) | Sí, con `targetConfigs` | — |
-| Proyecto sin necesidad real de múltiples ambientes (solo prod) | Innecesario — un solo `defaultConfigs` alcanza, no hace falta el sistema de flavors de BuildKonfig | — |
+## 5. Buenas prácticas y errores comunes — checklist de auditoría
 
-## 5. Caso trampa
+Si una IA (o un compañero) escribió o modificó la configuración de BuildKonfig, revisar:
 
-**"Configuré `defaultConfigs('staging')` pero al compilar sigue usando los valores de dev."**
-
-La trampa: `buildkonfig.flavor` tiene que existir como property de Gradle *antes* de que se evalúe el plugin — si la seteás dinámicamente dentro del mismo `build.gradle.kts` con lógica condicional mal ubicada (por ejemplo, después del bloque `buildkonfig { }`), el plugin ya leyó el valor por default. La forma correcta es fijarla en `gradle.properties`, pasarla por `-P` en el comando de build, o (si viene de un scheme de Xcode / variante de Android) setearla vía `project.extra.set("buildkonfig.flavor", ...)` **antes** de que Gradle evalúe el bloque `buildkonfig { }` — no después.
-
-Otro trampa relacionada: los nombres de flavor en `defaultConfigs("staging")` son strings libres — un typo (`"stagin"`) no da error de compilación, simplemente ese flavor nunca hace match y silenciosamente cae al `defaultConfigs` base. Vale la pena revisar el valor generado (`generateBuildKonfig` deja el archivo generado inspeccionable) después de cambiar el flavor activo, en vez de asumir que compiló bien porque no tiró error.
-
-## 6. Conexión con arquitectura real (Timbax)
-
-En Timbax, `TimbaxConfig.BASE_URL` (o el nombre de objeto que se elija) sería consumido exclusivamente en la capa `data`, específicamente al construir el `HttpClient` de Ktor (ver `remote_ktor.md`) — nunca en `domain` ni en `presentation`. Esto respeta la Dependency Rule: el `UseCase` que pide jugadores no sabe ni le importa si el `BASE_URL` es de staging o de prod, solo el `RepositoryImpl`/factory de Ktor necesita esa información al momento de armar el cliente HTTP.
+- **¿`defaultConfigs` (base, sin nombre) está declarado?** Es obligatorio — si falta, el plugin no genera código.
+- **¿El nombre del flavor en `defaultConfigs("staging")` matchea exactamente** el valor de `buildkonfig.flavor` que se usa en CI/local? Un typo (`"stagin"`) no tira error — cae silenciosamente al `defaultConfigs` base. Vale la pena revisar el archivo generado (`generateBuildKonfig` lo deja inspeccionable) después de cambiar el flavor activo.
+- **¿`buildkonfig.flavor` se fija *antes* de que Gradle evalúe el bloque `buildkonfig { }`?** Si se setea con lógica condicional ubicada después de ese bloque en el mismo `build.gradle.kts`, el plugin ya leyó el valor por default — la property tiene que existir en `gradle.properties`, pasarse por `-P`, o setearse vía `project.extra.set("buildkonfig.flavor", ...)` antes de la evaluación del bloque.
+- **¿Hay algún valor sensible (API key real, no solo config) commiteado directamente en el `build.gradle.kts`?** BuildKonfig es transporte type-safe, no gestión de secretos — el valor real nunca debería estar en el repo; se inyecta desde `gradle.properties` local (gitignored) o secrets de CI (ver `secretos_gitignore.md`).
+- **¿Se está usando BuildKonfig para algo que necesita cambiar en runtime sin recompilar?** Eso es un error de diseño — BuildKonfig genera valores fijos en compile-time; para eso existe Remote Config o un endpoint de configuración remota, no este mecanismo.
+- **¿El objeto generado se consume solo desde la capa `data`?** Si aparece una referencia a `OrdersConfig` (o el nombre de objeto que se use) dentro de un `UseCase` o un `ViewModel`, es una violación de la Dependency Rule — domain y presentation no deberían saber en qué ambiente están corriendo.
