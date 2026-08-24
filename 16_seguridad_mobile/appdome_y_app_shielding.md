@@ -1,20 +1,44 @@
 # Appdome y app shielding (RASP)
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-**RASP (Runtime Application Self-Protection)** es la categoría de seguridad que protege una app *mientras corre*, detectando y reaccionando a ataques en tiempo real — a diferencia de defensas "estáticas" (revisar el código antes de publicar). **Appdome** es una plataforma **no-code** que se engancha al pipeline de CI/CD y le inyecta estas protecciones al binario ya compilado, sin que el equipo de desarrollo escriba código de seguridad ni integre un SDK propio: Appdome es una plataforma de seguridad mobile sin código que protege apps Android y iOS sin requerir SDKs, cambios de código, ni recursos de desarrollo especializados — usa tecnología patentada llamada Fusion para inyectar capas de seguridad directamente en los binarios compilados de la app a través de pipelines de CI/CD.
+```mermaid
+flowchart LR
+    A[App compilada<br/>.apk / .ipa] --> B[Pipeline CI/CD]
+    B --> C[Appdome Fusion]
+    C --> D{Elegir protecciones<br/>en consola no-code}
+    D --> E[Binario blindado<br/>con ONEShield]
+    E --> F[Firmar y publicar<br/>en las stores]
 
-Su producto RASP se llama **ONEShield**: ONEShield es la solución de runtime application self-protection de Appdome, que defiende contra reversing dinámico, tampering, debugging, uso de emuladores, hooking frameworks como Frida y Xposed, y ataques de repackaging — opera sin integración de código ni SDK.
+    subgraph Runtime["Mientras la app corre en el dispositivo"]
+    G[Anti-tampering]
+    H[Anti-debugging]
+    I[Detección de emuladores]
+    J[Anti-hooking<br/>Frida / Xposed]
+    end
 
-## 2. El problema que resuelve
+    E -.protege contra.-> Runtime
+```
 
-Play Integrity (ver archivo anterior) te da un **veredicto puntual**: "en este momento, este dispositivo/binario parece genuino". Pero no hace nada activo si un atacante engancha un debugger en tu app corriendo, o usa Frida para hookear funciones en runtime y modificar el comportamiento de la app *mientras el usuario la usa*. RASP cubre esa brecha: permite agregar features de runtime application self-protection como anti-tampering, anti-reversing, anti-debugging, ofuscación de código, cifrado de datos, prevención de jailbreak/root, prevención de MitM, y más, para prevenir amenazas maliciosas a usuarios, apps y datos móviles.
+## 2. Qué es y cómo funciona
 
-El problema de fondo que resuelve Appdome específicamente (más allá de RASP en general) es de **costo de ingeniería**: implementar estas protecciones a mano (ofuscación, detección de debugger, detección de hooking frameworks) es trabajo especializado y constante — cada nueva técnica de ataque requiere actualizar la defensa. Appdome usa IA para construir cualquiera de sus más de 400 features de RASP y app shielding con conciencia de amenazas, incluyendo anti-tampering, anti-debugging, anti-repackaging, anti-resigning, detección de jailbreak/root y más, dentro del pipeline de CI/CD, para que el equipo de desarrollo mobile no tenga que hacerlo.
+**RASP (Runtime Application Self-Protection)** es la categoría de seguridad que protege una app *mientras corre*, detectando y reaccionando a ataques en tiempo real — a diferencia de defensas "estáticas" (revisar el código antes de publicar). **Appdome** es una plataforma **no-code** que se engancha al pipeline de CI/CD y le inyecta estas protecciones al binario ya compilado, sin que el equipo escriba código de seguridad ni integre un SDK propio: usa tecnología propia (Fusion) para inyectar capas de seguridad directamente en los binarios compilados a través del pipeline.
 
-## 3. Ejemplo mínimo comentado
+Su producto RASP se llama **ONEShield**: defiende contra reversing dinámico, tampering, debugging, uso de emuladores, y hooking frameworks como Frida y Xposed — opera sin integración de código ni SDK. Un dato técnico concreto que se mantiene vigente en 2026: **ONEShield solo soporta arquitecturas ARM de 64 bits**, no x86 — esto es intencional, porque x86 es la arquitectura típica de emuladores/simuladores, y bloquearla es parte de la defensa contra ese vector de ataque.
 
-Esto **no es código que escribas en Kotlin** — es configuración de pipeline. El punto central del "no-code" es que no hay snippet de Kotlin/Swift que mostrar: se sube el `.apk`/`.ipa` ya compilado a la plataforma de Appdome (o se integra en el paso de CI/CD), se elige qué protecciones aplicar desde una consola, y Appdome devuelve el binario ya blindado.
+**El problema que resuelve:** Play Integrity (archivo anterior) da un **veredicto puntual** — "en este momento, este dispositivo/binario parece genuino". Pero no hace nada activo si un atacante engancha un debugger a la app corriendo, o usa Frida para hookear funciones en runtime y modificar el comportamiento *mientras el usuario la usa*. RASP cubre esa brecha: agrega defensas activas como anti-tampering, anti-reversing, anti-debugging, ofuscación de código, y prevención de jailbreak/root, corriendo en el dispositivo mismo. El problema de fondo que resuelve Appdome específicamente es de **costo de ingeniería**: implementar estas protecciones a mano es trabajo especializado y constante, porque cada nueva técnica de ataque requiere actualizar la defensa.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness** con datos de salud del usuario pero sin economía competitiva ni pagos in-app, RASP suele quedar fuera de alcance en una primera etapa: el "peor caso" de un binario tampereado (alguien viendo sus propios datos de entrenamiento modificados localmente) no representa un riesgo de negocio que justifique el costo de una herramienta enterprise sin tier gratuito.
+
+En una **app de e-commerce** con pagos integrados y programas de fidelidad canjeables, el cálculo cambia: ahí el shielding runtime protege contra que un atacante hookee la lógica de checkout en memoria para alterar precios o montos antes de que el request salga al backend — un escenario de fraude con impacto económico directo que sí justifica evaluar RASP.
+
+## 4. Implementación real
+
+**Pedido del PO:** *"Antes de publicar el release a producción, quiero que el binario pase por una capa de shielding automática dentro del pipeline, sin que el equipo tenga que mantener código de ofuscación a mano."*
+
+Esto **no es código Kotlin** — es configuración de pipeline. El punto central del "no-code" es que no hay snippet de Kotlin/Swift que mostrar: se sube el `.apk`/`.ipa` ya compilado a Appdome (o se integra como paso de CI/CD), se eligen las protecciones desde una consola, y Appdome devuelve el binario ya blindado.
 
 ```yaml
 # .github/workflows/release.yml — paso conceptual, no oficial
@@ -31,28 +55,17 @@ Esto **no es código que escribas en Kotlin** — es configuración de pipeline.
   # output: app-release-shielded.apk, listo para firmar y publicar
 ```
 
-La app que se construye para Appdome puede armarse con cualquier herramienta nativa, como Xcode para iOS o Android Studio, u otro framework, incluyendo frameworks híbridos y cross-platform como Maui, Xamarin, Cordova, React Native, y Flutter. Compose Multiplatform genera un binario nativo estándar (APK/AAB para Android, framework para iOS embebido en un proyecto Xcode), así que encaja en esa misma categoría de "cualquier binario nativo" sin requerir soporte explícito de KMP.
+La app que se construye para Appdome puede armarse con cualquier herramienta nativa — Xcode, Android Studio, u otros frameworks cross-platform (Maui, Xamarin, Cordova, React Native, Flutter). Compose Multiplatform genera un binario nativo estándar (APK/AAB para Android, framework para iOS embebido en un proyecto Xcode), así que encaja en esa misma categoría de "cualquier binario nativo" sin requerir soporte explícito de KMP.
 
-## 4. Matriz de criterio
+## 5. Buenas prácticas y errores comunes
 
-**Usar Appdome (o herramientas RASP equivalentes) cuando:**
-- La app maneja datos regulados o de alto valor donde el sector espera este nivel de protección por default — banca, fintech, salud. Promon SHIELD es un vendor de app shielding usado fuertemente en fintech y banca móvil.
-- El equipo no tiene capacidad ni tiempo de mantener ofuscación/anti-tampering a mano, y el presupuesto permite una herramienta enterprise (Appdome usa pricing enterprise custom basado en la cantidad de apps y defensas requeridas — no hay tier gratuito ni plan self-serve, hay que contactar a ventas).
-- Se necesita evidencia de compliance ante auditorías (certificación de que cada build cumple ciertas políticas anti-fraude/ciber).
+Checklist para auditar si esta decisión (usar o no RASP) la tomó una IA o un compañero apurado:
 
-**NO usar (o evaluar alternativas más livianas) cuando:**
-- Es una app de consumo sin datos sensibles ni economía en juego — Timbax es el ejemplo típico: el "peor caso" de un binario tampereado no representa un riesgo de negocio real.
-- El presupuesto no alcanza para una herramienta enterprise sin tier gratuito. Existen alternativas con footprint más chico y opciones gratuitas parciales, como Talsec RASP+, que ofrece mobile RASP y detección de amenazas en runtime con un tier gratuito (freeRASP) y un SDK pago (AppiCrypt) — footprint más simple que Appdome, enfocado en RASP en vez del stack completo de fraude/bots.
-- El equipo prefiere control fino a nivel de código sobre "caja negra" de terceros — la alternativa de ofuscación a nivel compilador (Guardsquare con DexGuard + iXGuard, ofuscación y hardening a nivel de compilador para Android e iOS — más fuerte en protección profunda de código y ofuscación de bytecode, pero requiere integración en etapa de build en vez de no-code) da más control pero exige integración manual en el pipeline de build.
+- **¿El dominio de la app justifica el costo enterprise de Appdome?** Es pricing custom sin tier gratuito ni plan self-serve — tiene sentido en banca, fintech, salud, o cualquier contexto con requisito de compliance/auditoría explícito. Para una app de consumo sin datos sensibles ni economía en juego, el "peor caso" de un binario tampereado no representa un riesgo de negocio real, y el costo/beneficio rara vez cierra.
+- **¿Se evaluaron alternativas de menor footprint antes de ir directo a una herramienta enterprise?** Talsec ofrece un tier gratuito (freeRASP) con un SDK pago (AppiCrypt) para protecciones avanzadas — footprint más chico, enfocado en RASP puro en vez del stack completo de fraude/bots. Guardsquare (DexGuard + iXGuard) da ofuscación y hardening a nivel de compilador con más control de código, pero exige integración manual en el pipeline de build en vez de no-code. Promon SHIELD es una alternativa RASP-only con fuerte adopción en fintech/banca.
+- **¿Se testeó el binario shielded, no solo el build normal?** Blindar un binario después del build puede generar falsos positivos de anti-debugging en dispositivos legítimos, o incompatibilidades de arquitectura (ONEShield es ARM64-only, no corre en x86). No es un paso transparente sin efectos secundarios — hay que agregarlo al checklist de QA de release.
+- **¿Se está tratando "ya tenemos Play Integrity" como sustituto de RASP?** Ver Caso trampa: son capas complementarias, no intercambiables.
 
-**Trade-off real:** no-code significa velocidad de adopción y cero mantenimiento de la lógica de seguridad en sí, pero también significa dependencia de un tercero para toda la superficie de seguridad runtime, con pricing enterprise y sin transparencia total de cómo se instrumenta el binario. Es lo opuesto en filosofía a "dueño de tu propio código" — para un equipo chico, el costo/beneficio rara vez cierra salvo que el dominio (fintech, salud) lo exija.
+**Caso trampa:** "ya usamos Play Integrity, no necesitamos RASP" — son capas distintas que resuelven momentos distintos del ataque. Play Integrity dice si se puede confiar en el dispositivo/binario **en el momento del request**; RASP protege la app **mientras corre**, incluso si el dispositivo pasó el chequeo de integridad inicial. Un atacante podría pasar la verificación al arrancar la app y luego, ya con la app corriendo, engancharle un debugger o un framework de hooking para interceptar lógica de negocio en memoria — eso Play Integrity no lo detecta, porque ya emitió su veredicto antes de que empezara el ataque.
 
-## 5. Caso trampa
-
-"Ya usamos Play Integrity, no necesitamos RASP" — son capas distintas que resuelven momentos distintos del ataque. Play Integrity te dice **si podés confiar en este dispositivo/binario en el momento del request**; RASP protege la app **mientras corre**, incluso si el dispositivo pasó el chequeo de integridad inicial. Un atacante podría pasar la verificación de integridad al arrancar la app y luego, ya con la app corriendo, engancharle un debugger o un framework de hooking para interceptar lógica de negocio en memoria — eso Play Integrity no lo detecta porque ya emitió su veredicto antes de que empezara el ataque. Son complementarios, no sustitutos: Play Integrity es un chequeo puntual server-verificado; RASP es defensa continua en el dispositivo mismo.
-
-Otro caso trampa: pensar que "no-code" significa "sin riesgo de romper la app". Blindar un binario después del build agrega una capa que puede interactuar mal con el propio código de la app (falsos positivos de anti-debugging en dispositivos legítimos, incompatibilidades con ciertas arquitecturas — ONEShield de Appdome solo soporta arquitecturas ARM de 64 bits). Hay que testear el binario shielded, no asumir que es un paso transparente sin efectos secundarios.
-
-## 6. Conexión con arquitectura real (Timbax)
-
-Timbax no usa Appdome ni ninguna herramienta de RASP hoy, y coincide directamente con el criterio de "NO usar" de la sección 4: es una app de consumo (tracker de puntajes de juegos de cartas) sin datos financieros ni PII regulada, sin economía competitiva server-validada — el mismo razonamiento que llevó a no implementar Play Integrity (`play_integrity_api.md`) ni certificate pinning explícito (`cifrado_datos_en_transito.md`). Los tres archivos de este package hasta acá forman un patrón consistente de criterio: cada capa de seguridad extra (pinning, integrity attestation, RASP) tiene un costo operativo real, y para el perfil de riesgo de Timbax ese costo no se justifica — la protección de base (TLS estándar, Firebase Auth, reglas de seguridad de Firestore/Firebase) es proporcional al dominio de la app.
+Otro caso trampa, distinto del anterior: pensar que "no-code" significa "sin riesgo de romper la app" — cubierto arriba en el primer punto del checklist (testear el binario shielded).

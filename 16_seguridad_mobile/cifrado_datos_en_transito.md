@@ -1,34 +1,61 @@
 # Cifrado de datos en tránsito
 
-## 1. Qué es
+## 1. Mapa del flujo
 
-Es la protección de los datos mientras viajan por la red, entre el cliente (tu app) y el servidor — a diferencia del cifrado "en reposo" (datos guardados en disco, DB, DataStore), que es un problema distinto con sus propias herramientas. El mecanismo estándar es TLS (Transport Layer Security, sucesor de SSL): cifra el canal completo para que nadie que intercepte el tráfico pueda leer ni modificar los datos en tránsito.
+```mermaid
+sequenceDiagram
+    participant App as App (cliente KMP)
+    participant OS as SO (Android/iOS)
+    participant Srv as Servidor / Backend
 
-HTTPS no es más que HTTP corriendo sobre TLS. Cuando tu `HttpClient` de Ktor apunta a una URL `https://`, ya estás usando cifrado en tránsito por default — no es algo que actives a mano, es el comportamiento estándar de cualquier engine (OkHttp, Darwin, CIO) contra un endpoint HTTPS bien configurado.
+    App->>Srv: Inicia conexión HTTPS
+    Srv-->>App: Certificado del servidor
+    App->>OS: ¿Cadena de confianza válida? (CA reconocida)
+    OS-->>App: Certificado válido ✅
+    Note over App: Si hay pinning:<br/>compara certificado/clave contra el pin fijo
+    App->>Srv: Canal cifrado establecido (TLS)
+    App->>Srv: Request (datos en claro, cifrados por TLS en tránsito)
+    Srv-->>App: Response (cifrada en tránsito)
 
-## 2. El problema que resuelve
-
-Sin TLS, cualquier persona con acceso a la red por la que viaja el tráfico — un Wi-Fi público, un router comprometido, un proxy corporativo mal configurado — puede leer el contenido crudo de cada request y response: tokens de sesión, contraseñas, datos personales del usuario. Esto se llama ataque **man-in-the-middle (MITM)**: un tercero se posiciona entre el cliente y el servidor, interceptando (y potencialmente modificando) el tráfico sin que ninguna de las dos partes lo note.
-
-TLS resuelve esto con cifrado + verificación de identidad: el cliente valida que el certificado del servidor fue emitido por una autoridad certificadora (CA) confiable y corresponde al dominio al que se está conectando, antes de establecer el canal cifrado. El problema real que queda abierto (y que TLS por sí solo no resuelve) es: ¿qué pasa si el atacante logra que tu dispositivo confíe en un certificado falso? Ahí entra **certificate pinning**, un nivel extra de protección.
-
-## 3. Ejemplo mínimo comentado
-
-TLS "gratis" simplemente usando HTTPS — no hace falta código extra:
-
-```kotlin
-// commonMain — esto YA viaja cifrado, TLS es transparente
-val client = HttpClient {
-    install(ContentNegotiation) {
-        json(Json { ignoreUnknownKeys = true })
-    }
-}
-
-suspend fun getPlayers(): List<PlayerDto> =
-    client.get("https://api.timbax.com/players").body()
+    rect rgb(255, 230, 230)
+    Note over App,Srv: Atacante MITM interceptando la red<br/>ve solo bytes cifrados, no puede leer ni modificar
+    end
 ```
 
-Certificate pinning explícito (un paso más allá de TLS estándar), configurado por engine ya que cada plataforma expone su propia API nativa para esto:
+## 2. Qué es y cómo funciona
+
+**Cifrado en tránsito** protege los datos mientras viajan por la red entre el cliente (tu app) y el servidor — distinto del cifrado "en reposo" (datos guardados en disco, DB, DataStore), que es un problema aparte con sus propias herramientas. El mecanismo estándar es **TLS** (Transport Layer Security, sucesor de SSL): cifra el canal completo para que nadie que intercepte el tráfico pueda leer ni modificar los datos.
+
+**HTTPS es HTTP corriendo sobre TLS.** Cuando el `HttpClient` de Ktor apunta a una URL `https://`, ya hay cifrado en tránsito por default — no es algo que se active a mano, es el comportamiento estándar de cualquier engine (OkHttp, Darwin, CIO) contra un endpoint bien configurado.
+
+**El problema que resuelve:** sin TLS, cualquiera con acceso a la red por la que viaja el tráfico — Wi-Fi público, router comprometido, proxy corporativo mal configurado — puede leer el contenido crudo de cada request/response: tokens de sesión, contraseñas, datos personales. Esto es un ataque **man-in-the-middle (MITM)**: un tercero se posiciona entre cliente y servidor, interceptando (y potencialmente modificando) el tráfico sin que ninguna de las dos partes lo note.
+
+TLS resuelve esto con cifrado + verificación de identidad: el cliente valida que el certificado del servidor fue emitido por una autoridad certificadora (CA) confiable y corresponde al dominio al que se conecta, antes de establecer el canal cifrado. Lo que TLS estándar **no** resuelve por sí solo: ¿qué pasa si el atacante logra que el dispositivo confíe en un certificado falso? Ahí entra **certificate pinning** — en vez de confiar en "cualquier certificado válido según el sistema operativo", el cliente valida contra un certificado o clave pública específica que vos definiste. Así, aunque el dispositivo tenga un certificado raíz comprometido instalado (típico en ataques dirigidos, o perfiles de configuración maliciosos), la app rechaza la conexión si no coincide con el pin esperado.
+
+## 3. Cómo se ve en distintos contextos
+
+En una **app de fitness** que sincroniza entrenamientos con un backend propio, TLS estándar alcanza: los datos son sensibles pero no hay un escenario de fraude financiero directo, y el equipo no tiene proceso de rotación de certificados coordinado con releases — sumar pinning ahí significaría asumir un riesgo operativo (romper la app en producción si un pin queda desactualizado) sin un beneficio proporcional.
+
+En una **app de e-commerce** que procesa pagos y guarda datos de tarjetas tokenizados, el cálculo cambia: el costo de un MITM exitoso es alto (robo de datos de pago), así que justifica certificate pinning explícito sobre los endpoints de checkout — asumiendo que el equipo tiene un proceso maduro de rotación de certificados coordinado con el ciclo de releases de la app.
+
+## 4. Implementación real
+
+**Pedido del PO:** *"Las llamadas que traen el historial de pedidos (`Orders`) del backend van a mostrar datos del usuario — quiero que esa conexión esté protegida con certificate pinning, no solo con HTTPS estándar."*
+
+TLS estándar no requiere código extra — ya está cubierto por usar `https://`. El trabajo real es configurar el pinning por engine, porque cada plataforma expone su propia API nativa:
+
+```kotlin
+// commonMain — el HttpClient se usa igual en todo el código de red,
+// el pinning se configura solo en la construcción del engine por plataforma
+expect fun createHttpClient(): HttpClient
+
+class OrdersRemoteDataSource(
+    private val client: HttpClient
+) {
+    suspend fun getOrderHistory(): List<OrderDto> =
+        client.get("https://api.example.com/orders").body()
+}
+```
 
 ```kotlin
 // androidMain — engine OkHttp
@@ -37,7 +64,14 @@ actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {
         config {
             certificatePinner(
                 CertificatePinner.Builder()
-                    .add("api.timbax.com", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                    .add(
+                        "api.example.com",
+                        "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // pin primario
+                    )
+                    .add(
+                        "api.example.com",
+                        "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=" // pin de backup
+                    )
                     .build()
             )
         }
@@ -50,35 +84,20 @@ actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {
 actual fun createHttpClient(): HttpClient = HttpClient(Darwin) {
     engine {
         val builder = CertificatePinner.Builder()
-            .add(pattern = "api.timbax.com", pins = pinnedHashes)
+            .add(pattern = "api.example.com", pins = pinnedHashesForApi)
         handleChallenge(builder.build())
     }
 }
 ```
 
-## 4. Matriz de criterio
+El **pin de backup** en el ejemplo de Android no es decorativo: es la mitigación directa del riesgo operativo central de pinning (ver Sección 5) — si el certificado primario rota, el backup evita que la app quede bloqueada en producción hasta el próximo release.
 
-**Usar TLS estándar (sin pinning extra) cuando:**
-- Es cualquier app que hable con un backend propio — no es opcional, es la base mínima innegociable. No hay escenario legítimo donde valga la pena mandar datos en claro por HTTP.
-- El riesgo de MITM está cubierto razonablemente por la validación estándar de cadena de certificados (CA confiable + dominio correcto).
+## 5. Buenas prácticas y errores comunes
 
-**Sumar certificate pinning cuando:**
-- La app transfiere datos sensibles (pagos, datos personales regulados, credenciales) y el costo de un MITM exitoso es alto.
-- Es un contexto de alto riesgo de red no confiable (apps usadas en países con infraestructura de red intervenida, redes corporativas con proxies MITM legítimos pero indeseados para tu app).
+Checklist para auditar si esto lo escribió una IA (o un compañero apurado):
 
-**NO usar pinning cuando:**
-- El equipo no tiene proceso de rotación de certificados/pines coordinado con releases de la app — un cert que expira sin que el pin se haya actualizado en una versión ya publicada **rompe la app en producción para todos los usuarios en esa versión**, sin posibilidad de fix server-side. Es el trade-off central: pinning es seguridad real, pero es una responsabilidad operativa permanente, no un flag que se prende y se olvida.
-- El backend rota certificados frecuentemente (ej: certificados gestionados automáticamente con renovación corta) sin un mecanismo de pines múltiples/backup — mismo riesgo de romper la app.
-- Es un proyecto chico o interno donde el costo de mantenimiento no se justifica frente al riesgo real.
-
-**Trade-off real:** TLS estándar es gratis y obligatorio. Pinning agrega una capa de seguridad genuina contra MITM con certificados falsos válidos, pero convierte cada renovación de certificado del backend en un evento coordinado que puede tumbar la app si se gestiona mal.
-
-## 5. Caso trampa
-
-"Ya tenemos HTTPS, así que estamos protegidos contra MITM" — esto es cierto contra un atacante que no puede conseguir un certificado válido para tu dominio. Pero no cubre el escenario donde el atacante logra que el **dispositivo** confíe en un certificado falso (por ejemplo, instalando un certificado raíz malicioso en el dispositivo — típico en ataques dirigidos, o en entornos donde el usuario instaló sin saberlo un perfil de configuración comprometido). En ese caso, TLS estándar valida correctamente la cadena de confianza... contra una cadena de confianza que ya está comprometida. La app confía en el certificado falso porque el sistema operativo también confía en él.
-
-Certificate pinning es justamente la respuesta a esto: en vez de confiar en "cualquier certificado válido según el sistema", el cliente valida contra un certificado o clave pública específica que vos definiste — así que aunque el dispositivo tenga un certificado raíz comprometido instalado, tu app igual rechaza la conexión si no coincide con el pin esperado.
-
-## 6. Conexión con arquitectura real (Timbax)
-
-En Timbax, el `HttpClient` de Ktor se construye vía Koin con el engine específico por plataforma (`OkHttp` en `androidMain`, `Darwin` en `iosMain`) — como ya está documentado en `03_data/ktor_engines_por_plataforma.md`. TLS estándar ya está cubierto automáticamente por usar `https://` contra Firebase/backend. Certificate pinning explícito no está implementado hoy porque Timbax no maneja datos financieros ni PII sensible más allá de nombres de jugadores y puntajes — encaja con el criterio de "NO usar pinning" de la sección 4: el costo operativo de mantener pines coordinados con la rotación de certificados de Firebase no se justifica frente al riesgo real del dominio de la app.
+- **¿El pinning tiene un pin de backup, no solo uno?** Un solo pin sin respaldo convierte cualquier rotación de certificado en un evento de riesgo — si el cert rota antes de que salga una nueva versión con el pin actualizado, la app queda **rota en producción para todos los usuarios de esa versión**, sin fix server-side posible.
+- **¿Hay un proceso de rotación de certificados/pines coordinado con el calendario de releases?** Si la respuesta es "no lo pensamos", pinning no debería estar en producción todavía — es una responsabilidad operativa permanente, no un flag que se prende y se olvida.
+- **¿Se está pineando el dominio correcto y con el algoritmo de hash correcto (`sha256/`)?** Un pin mal calculado o apuntando al dominio equivocado falla en silencio o bloquea todo el tráfico.
+- **¿Justifica el dominio de la app el costo de mantenimiento del pinning?** Si no hay datos financieros, PII regulada, ni un escenario de MITM de alto impacto, agregar pinning es sobre-ingeniería que solo suma riesgo de romper la app sin beneficio proporcional — TLS estándar ya cubre la gran mayoría de los casos.
+- **¿El código asume que "HTTPS ya es suficiente" en un contexto donde el dato es sensible?** Ver Caso trampa: TLS estándar no protege contra un dispositivo con una cadena de confianza ya comprometida (certificado raíz malicioso instalado). Si el dominio de la app maneja pagos o PII regulada, esa suposición es un gap de seguridad real, no un detalle menor.
