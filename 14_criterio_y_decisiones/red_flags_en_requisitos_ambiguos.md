@@ -1,54 +1,78 @@
 # Red flags en requisitos ambiguos
 
-## 1. Qué es
+## 1. Mapa del flujo
+
+```mermaid
+flowchart TD
+    REQ["Requisito del PO<br/>(suena cerrado, sin ambigüedad aparente)"] --> SCAN{"¿Esconde un caso<br/>que el requisito no contesta?"}
+    SCAN -->|No detectado| GUESS["Dev interpreta y programa<br/>la primera lectura que se le ocurre"]
+    SCAN -->|Detectado| ASK["Se pregunta al PO<br/>antes de programar"]
+    GUESS --> BUG["El bug aparece semanas después,<br/>cuando el caso real ocurre"]
+    ASK --> SPEC["Requisito específico,<br/>ahora sí listo para arquitectura"]
+```
+
+El punto del diagrama no es el requisito en sí — es el momento en que se detecta la ambigüedad. Si se detecta antes de programar (`ASK`), cuesta una interrupción de minutos. Si no se detecta (`GUESS`), el costo aparece después, disfrazado de bug.
+
+## 2. Qué es y cómo funciona
 
 Es el conjunto de señales que indican que un requisito, tal como llegó del PO, todavía no está listo para convertirse en arquitectura — porque esconde una ambigüedad que, si no se resuelve antes de programar, se termina resolviendo *por accidente* en el código, con la primera interpretación que se le ocurrió al dev en el momento. Detectar estas señales es tan parte del trabajo técnico como escribir el código en sí.
 
-## 2. El problema que resuelve
+Un requisito ambiguo no explota en el momento en que se escribe — explota semanas después, cuando el comportamiento "obvio" que se implementó no era el que el PO tenía en mente, o cuando aparece un caso borde que el requisito original nunca contempló porque nadie lo preguntó. La causa raíz casi siempre es la misma: el dev interpretó el requisito en vez de chequear la ambigüedad con el PO *antes* de programar.
 
-Un requisito ambiguo no explota en el momento en que se escribe — explota semanas después, cuando el comportamiento "obvio" que se implementó no era el que el PO tenía en mente, o cuando aparece un caso borde que el requisito original nunca contempló porque nadie lo preguntó. La causa raíz casi siempre es la misma: el dev interpretó el requisito en vez de chequear la ambigüedad con el PO *antes* de programar. Tener un catálogo de red flags conocidas convierte esto de "me doy cuenta cuando ya es tarde" a "lo detecto en el momento en que leo el pedido".
+Como muestra el diagrama, tener un catálogo de red flags conocidas convierte esto de "me doy cuenta cuando ya es tarde" a "lo detecto en el momento en que leo el pedido" — el checklist de la Sección 5 de este archivo es justamente ese catálogo, aplicado además al código que entrega una IA (que hereda la misma ambigüedad si nadie la resolvió antes del prompt).
 
-## 3. Ejemplo mínimo comentado
+## 3. Cómo se ve en distintos contextos
 
-Pedido real: *"Que se pueda editar el nombre de un jugador después de creado."*
+**App de fitness:** el PO pide *"que se pueda cambiar el nombre de un ejercicio en una rutina ya guardada."* Suena trivial — es un campo de texto que se actualiza. La red flag es que el requisito no dice qué pasa con las rutinas ya completadas en el historial que referencian ese ejercicio por nombre: ¿el historial debe mostrar el nombre viejo (foto del momento en que se hizo la rutina) o el nuevo (siempre el actual)? Son dos diseños de modelo distintos — snapshot del nombre en el momento del registro, o resolución en tiempo de lectura contra el ejercicio actual — y el requisito, tal como está escrito, no elige entre los dos.
+
+**App de e-commerce:** el PO pide *"que el usuario pueda cancelar un pedido."* Acá la ambigüedad no está en el modelo sino en el estado: "cancelar" puede significar reembolso automático inmediato, o solo marcar el pedido como cancelado y dejar el reembolso como un proceso manual aparte que corre después. Programar la primera lectura ("cancelar = reembolsar ya") sin preguntar puede disparar dinero real antes de que el equipo de soporte confirme que corresponde.
+
+## 4. Implementación real
+
+Pedido real: *"Que se pueda editar el nombre de un producto dentro de un pedido ya hecho, por si el restaurante lo cambió."*
 
 ```kotlin
-// Red flag: el requisito no dice qué pasa con datos relacionados
-// que ya referencian a ese jugador por nombre (no por id).
+// Red flag: el requisito no dice qué pasa con pedidos que ya
+// referencian ese producto por nombre, ya hechos antes del cambio.
 
-// Interpretación A (la que un dev suele asumir sin preguntar):
-// el nombre es solo un campo más, se actualiza y listo.
-data class Player(val id: String, val name: String, val score: Int)
+// Interpretación A (la que un dev — o una IA sin este contexto —
+// suele asumir sin preguntar): el nombre es solo un campo más.
+data class OrderItem(
+    val productName: String,
+    val quantity: Int,
+    val unitPrice: Double
+)
 
-fun renamePlayer(player: Player, newName: String): Player =
-    player.copy(name = newName)
-
-// Pregunta que el requisito NO contesta:
-// ¿el historial de partidas ya jugadas debe mostrar el nombre VIEJO
-// (foto del momento) o el nombre NUEVO (siempre el actual)?
-// Esto define si el historial debe guardar el nombre como snapshot
-// o resolverlo por id en tiempo de lectura — son dos diseños de
-// modelo totalmente distintos, y el requisito original no lo dice.
+fun renameProduct(item: OrderItem, newName: String): OrderItem =
+    item.copy(productName = newName)
 ```
 
-La red flag acá no es el código — es que el requisito "editar nombre" suena trivial pero esconde una decisión de modelado (snapshot vs. referencia) que cambia el diseño de dominio entero si se responde mal.
+```kotlin
+// Pregunta que el requisito NO contesta, y que domain/model.md ya resolvió
+// para este repo (ver Sección 2 de ese archivo): OrderItem vive anidado
+// dentro de Order como snapshot — no se resuelve por id en tiempo de lectura.
+// Eso significa que renombrar el producto "maestro" en el catálogo NO debería
+// tocar los OrderItem de pedidos ya hechos — el pedido histórico muestra el
+// nombre que tenía en el momento de la compra, como un ticket real.
+//
+// Si el pedido del PO en realidad quería lo contrario (que TODO pedido,
+// pasado o futuro, refleje siempre el nombre actual del producto), eso
+// implica cambiar OrderItem de snapshot a referencia por id — un cambio
+// de modelo de dominio, no un rename de campo. La ambigüedad decide
+// cuál de los dos diseños es correcto, y el requisito tal como llegó
+// no lo dice.
+```
 
-## 4. Matriz de criterio
+La red flag acá no es el código — es que "editar el nombre" suena a un campo de texto, pero esconde una decisión ya tomada en otro archivo del propio dominio (`OrderItem` como snapshot) que el requisito podría estar pidiendo revertir sin saberlo.
 
-| Red flag en el requisito | Por qué es peligrosa | Qué preguntar antes de programar |
-|---|---|---|
-| Usa "y/o" sin aclarar cuál de los dos casos | El comportamiento real depende de una condición que nadie definió | "¿Es un Y o un O? ¿Qué pasa si se cumplen ambas condiciones a la vez?" |
-| Describe el resultado pero no el caso borde (vacío, error, offline) | Los estados de excepción se terminan improvisando en el código | "¿Qué se muestra si la lista está vacía / falla la red / el usuario cancela a mitad de camino?" |
-| Usa una palabra "obvia" que en realidad tiene más de un significado razonable (ej: "eliminar", "cancelar", "reiniciar") | Cada significado implica un diseño distinto (soft delete vs. hard delete, por ejemplo) | "Cuando decís 'eliminar', ¿se borra para siempre o se puede recuperar?" |
-| No aclara si el cambio afecta datos ya existentes o solo los nuevos | Migraciones de datos o inconsistencias retroactivas no contempladas | "¿Esto aplica también a lo que ya está guardado, o solo hacia adelante?" |
-| Pide "que sea como en [otra app]" sin especificar qué parte exactamente | Cada app resuelve el mismo problema de formas distintas — asumir cuál se referencia es adivinar | "¿Qué parte puntual de esa app querés replicar? ¿El flujo completo o solo un detalle visual?" |
+## 5. Buenas prácticas y errores comunes — qué auditar si te lo entrega la IA
 
-**Trade-off real:** preguntar antes de programar cuesta una interrupción de 2 minutos en una conversación con el PO. No preguntar y adivinar mal cuesta un ida-y-vuelta de QA, un fix, y —peor— erosiona la confianza del PO en que el equipo técnico entiende lo que se pide.
+- **¿El requisito usa "y/o" sin aclarar cuál de los dos casos aplica?** El comportamiento real depende de una condición que nadie definió — preguntar: *"¿es un Y o un O? ¿qué pasa si se cumplen ambas condiciones a la vez?"*
 
-## 5. Caso trampa
+- **¿Describe el resultado pero no el caso borde (lista vacía, error de red, cancelación a mitad de camino)?** Si el código que entrega una IA no tiene un `when` exhaustivo o un estado explícito para esos casos, es porque el requisito tampoco los tenía — el hueco se heredó, no se inventó en el código.
 
-PO pide: *"Que el jugador con menos puntos pague la ronda."* Parece un requisito cerrado y sin ambigüedad — hay un ganador claro por comparación numérica. La trampa está en el caso de empate, que el requisito ni siquiera menciona porque el PO probablemente no lo pensó al escribirlo. Un dev apurado programa `players.minBy { it.score }`, que en un empate devuelve *cualquiera* de los empatados de forma determinística pero arbitraria (el primero que encuentre según el orden interno de la lista) — no porque haya una regla de negocio detrás, sino porque así funciona `minBy` cuando hay múltiples mínimos. El bug no está en el código, está en haber programado una decisión de producto (qué pasa en un empate) sin haberla hecho explícita primero. La señal de alarma no era el requisito en sí — era notar que "el jugador con menos puntos" presupone que existe un único mínimo, algo que el dominio del juego no garantiza.
+- **¿Usa una palabra "obvia" que en realidad tiene más de un significado razonable — "eliminar", "cancelar", "reiniciar"?** Cada significado implica un diseño distinto (soft delete con `status = CANCELLED` que conserva el historial, vs. hard delete que borra el registro de Firestore/DataStore para siempre). Si la IA implementó uno de los dos sin que el requisito lo especificara, hay que confirmar cuál era el pedido real antes de aprobar el PR — revertir un hard delete después no es posible.
 
-## 6. Conexión con arquitectura real (Timbax)
+- **¿No aclara si el cambio afecta datos ya existentes o solo los nuevos?** Ver el ejemplo de Sección 4: renombrar algo "hacia adelante" y renombrarlo "retroactivamente" son dos migraciones de datos completamente distintas, y el requisito rara vez distingue cuál de las dos pide.
 
-En Timbax, justamente el cálculo de "quién ganó" o "quién debe" (en juegos con acumulación de puntaje) pasó por esta misma revisión: antes de escribir el `UseCase` correspondiente, hubo que confirmar explícitamente con la regla de negocio real del juego qué pasa en un empate, en vez de dejar que `minBy`/`maxBy` decidiera algo que en realidad era una decisión de producto sin resolver — el mismo patrón que este archivo describe en abstracto.
+- **¿El requisito asume que existe un único resultado posible (`el jugador con más puntos`, `el pedido más antiguo`) sin contemplar un empate?** Si el código usa `minBy`/`maxBy`/`first()` sobre una condición que puede tener múltiples resultados válidos, el desempate lo está decidiendo el orden interno de una lista — no una regla de negocio real. Confirmar explícitamente qué pasa en ese caso antes de aprobar.
